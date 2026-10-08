@@ -28,6 +28,7 @@ from deepspec.modeling.dspark.common import (
     sample_anchor_positions,
 )
 from deepspec.modeling.dspark.markov_head import build_markov_head
+from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.utils.sampling import sample_tokens
 
 
@@ -84,6 +85,16 @@ class Qwen3DSparkAttention(nn.Module):
             else None
         )
 
+    def project_context(self, target_hidden_states, position_embeddings):
+        """Loop-invariant projections, including context RoPE, once per layer."""
+        bsz, ctx_len = target_hidden_states.shape[:2]
+        shape = (bsz, ctx_len, self.num_key_value_heads, self.head_dim)
+        key = self.k_norm(self.k_proj(target_hidden_states).view(shape)).transpose(1, 2)
+        value = self.v_proj(target_hidden_states).view(shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        cos, sin = cos[:, :ctx_len].unsqueeze(1), sin[:, :ctx_len].unsqueeze(1)
+        return key * cos + rotate_half(key) * sin, value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -92,6 +103,7 @@ class Qwen3DSparkAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        projected_context_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
@@ -100,6 +112,26 @@ class Qwen3DSparkAttention(nn.Module):
             bsz, q_len, self.num_attention_heads, self.head_dim
         )
         q = self.q_norm(q).transpose(1, 2)
+        if projected_context_kv is not None:
+            shape = (bsz, q_len, self.num_key_value_heads, self.head_dim)
+            k_noise = self.k_norm(self.k_proj(hidden_states).view(shape)).transpose(1, 2)
+            v_noise = self.v_proj(hidden_states).view(shape).transpose(1, 2)
+            cos, sin = position_embeddings
+            cos, sin = cos[:, -q_len:].unsqueeze(1), sin[:, -q_len:].unsqueeze(1)
+            q = q * cos + rotate_half(q) * sin
+            k_noise = k_noise * cos + rotate_half(k_noise) * sin
+            k = torch.cat((projected_context_kv[0], k_noise), dim=-2)
+            v = torch.cat((projected_context_kv[1], v_noise), dim=-2)
+        else:
+            k, v = self._legacy_kv(hidden_states, target_hidden_states, bsz, ctx_len, q_len)
+            cos, sin = position_embeddings
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if past_key_values is not None:
+            cache_kwargs = {"sin": position_embeddings[1], "cos": position_embeddings[0], "cache_position": cache_position}
+            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        return self._attend(q, k, v, bsz, q_len, attention_mask, **kwargs)
+
+    def _legacy_kv(self, hidden_states, target_hidden_states, bsz, ctx_len, q_len):
         k_ctx = self.k_proj(target_hidden_states)
         k_noise = self.k_proj(hidden_states)
         v_ctx = self.v_proj(target_hidden_states)
@@ -112,11 +144,9 @@ class Qwen3DSparkAttention(nn.Module):
         )
         k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+        return k, v
+
+    def _attend(self, q, k, v, bsz, q_len, attention_mask, **kwargs):
         if (
             self.config._attn_implementation == "flex_attention"
             and self.num_key_value_groups > 1
@@ -247,6 +277,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         self.block_size = int(config.block_size)
         self.mask_token_id = config.mask_token_id
         self.num_anchors = int(config.num_anchors)
+        self.num_loops = int(getattr(config, "num_loops", 1))
+        if self.num_loops < 1:
+            raise ValueError("num_loops must be >= 1")
 
         # Markov head.
         self.markov_head = build_markov_head(config)
@@ -367,23 +400,48 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         target_hidden_states: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        num_loops: Optional[int] = None,
+        return_all_loop_hidden: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = noise_embedding
         target_hidden_states = self.hidden_norm(self.fc(target_hidden_states))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states=hidden_states,
-                target_hidden_states=target_hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                use_cache=use_cache,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        return self.norm(hidden_states)
+        loops = self.num_loops if num_loops is None else int(num_loops)
+        if not 1 <= loops <= self.num_loops:
+            raise ValueError(f"num_loops must be in [1, {self.num_loops}]")
+        context_cache = past_key_values if isinstance(past_key_values, ContextKVCache) else None
+        if loops > 1 and past_key_values is not None and context_cache is None:
+            raise ValueError("Repeated depth requires ContextKVCache, not a mixed block/context cache")
+        # Projection sharing is exact: the context and physical-layer weights
+        # are unchanged across loops. Keep the graph for training gradients.
+        projected = None
+        if self.num_loops > 1 or context_cache is not None:
+            projected = []
+            for index, layer in enumerate(self.layers):
+                pair = layer.self_attn.project_context(target_hidden_states, position_embeddings)
+                if context_cache is not None:
+                    pair = context_cache.update(*pair, index)
+                projected.append(pair)
+        exits = []
+        for _ in range(loops):
+            for index, layer in enumerate(self.layers):
+                layer_kwargs = dict(kwargs)
+                if projected is not None:
+                    layer_kwargs["projected_context_kv"] = projected[index]
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    target_hidden_states=target_hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=None if context_cache is not None else past_key_values,
+                    use_cache=use_cache,
+                    position_embeddings=position_embeddings,
+                    **layer_kwargs,
+                )
+            if return_all_loop_hidden:
+                exits.append(self.norm(hidden_states))
+        return tuple(exits) if return_all_loop_hidden else self.norm(hidden_states)
 
     def forward(
         self,
@@ -391,7 +449,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         target_hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
-    ) -> DSparkForwardOutput:
+        num_loops: Optional[int] = None,
+    ) -> DSparkForwardOutput | tuple[DSparkForwardOutput, ...]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -419,15 +478,16 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             block_size=self.block_size,
             device=device,
         )
-        output_hidden = self._forward_backbone(
+        output_hiddens = self._forward_backbone(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden_states=target_hidden_states,
             attention_mask=dspark_attn_mask,
+            num_loops=num_loops,
+            return_all_loop_hidden=True,
         )
 
         num_blocks = anchor_positions.size(1)
-        output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
 
         label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
             1, 1, -1
@@ -479,19 +539,6 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
         )
-        draft_logits = self.compute_logits(output_hidden).reshape(
-            bsz,
-            num_blocks,
-            self.block_size,
-            -1,
-        )
-        if self.markov_head is not None:
-            draft_logits = self.markov_head.apply_block_logits(
-                draft_logits,
-                token_ids=prev_token_ids,
-                hidden_states=output_hidden_4d,
-            )
-
         log_sampler_stats(
             seq_len=seq_len,
             loss_mask=loss_mask,
@@ -500,29 +547,34 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             block_size=self.block_size,
             num_anchors=self.num_anchors,
         )
-
-        confidence_pred = None
-        if self.confidence_head is not None:
-            if self.confidence_head_with_markov:
-                prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
-                    dtype=output_hidden_4d.dtype
+        outputs = []
+        for output_hidden in output_hiddens:
+            output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
+            draft_logits = self.compute_logits(output_hidden).reshape(
+                bsz, num_blocks, self.block_size, -1
+            )
+            if self.markov_head is not None:
+                draft_logits = self.markov_head.apply_block_logits(
+                    draft_logits, token_ids=prev_token_ids, hidden_states=output_hidden_4d,
                 )
-                confidence_features = torch.cat(
-                    [output_hidden_4d, prev_embeddings],
-                    dim=-1,
-                )
+            confidence_pred = None
+            if self.confidence_head is not None:
+                confidence_features = output_hidden_4d
+                if self.confidence_head_with_markov:
+                    prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids).to(
+                        dtype=output_hidden_4d.dtype
+                    )
+                    confidence_features = torch.cat((output_hidden_4d, prev_embeddings), dim=-1)
                 confidence_pred = self.confidence_head(confidence_features).float()
-            else:
-                confidence_pred = self.confidence_head(output_hidden_4d).float()
-
-        return DSparkForwardOutput(
-            draft_logits=draft_logits,
-            target_ids=target_ids,
-            eval_mask=eval_mask,
-            block_keep_mask=block_keep_mask,
-            confidence_pred=confidence_pred,
-            aligned_target_logits=aligned_target_logits,
-        )
+            outputs.append(DSparkForwardOutput(
+                draft_logits=draft_logits,
+                target_ids=target_ids,
+                eval_mask=eval_mask,
+                block_keep_mask=block_keep_mask,
+                confidence_pred=confidence_pred,
+                aligned_target_logits=aligned_target_logits,
+            ))
+        return tuple(outputs) if self.num_loops > 1 else outputs[0]
 
 
 __all__ = [
@@ -530,3 +582,4 @@ __all__ = [
     "Qwen3DSparkAttention",
     "Qwen3DSparkDecoderLayer",
 ]
+

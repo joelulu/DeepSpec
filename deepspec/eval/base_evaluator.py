@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from transformers import DynamicCache
 
+from deepspec.eval.profiling import DecodeProfiler
 from deepspec.data.parser import encode_chat_messages
 from deepspec.utils.sampling import (
     gather_token_probs,
@@ -194,6 +195,7 @@ def verify_draft_tokens(
     max_proposal_tokens: int,
     current_token_ids: torch.Tensor | None = None,
     stop_token_ids: list[int] | None = None,
+    capture_hidden_states: bool = True,
 ) -> VerificationResult:
     """Verify draft tokens with the target model and rejection sampling."""
     if proposal.draft_token_count > max_proposal_tokens:
@@ -219,7 +221,7 @@ def verify_draft_tokens(
         position_ids=verify_position_ids,
         past_key_values=past_key_values_target,
         use_cache=True,
-        output_hidden_states=True,
+        output_hidden_states=capture_hidden_states,
     )
     if target_output.logits.ndim != 3:
         raise ValueError(
@@ -317,6 +319,8 @@ def generate_decoding_sample(
     propose: Callable[..., DraftProposal],
     update: Callable[[Any, VerificationResult], None],
     post_verify: Callable[[DraftProposal, VerificationResult], None] | None = None,
+    profile: bool = False,
+    capture_hidden_states: bool = True,
 ) -> SimpleNamespace:
     """Speculative-decoding loop.
 
@@ -331,6 +335,7 @@ def generate_decoding_sample(
     assert input_ids.size(0) == 1, "only bsz=1 is supported"
 
     device = input_ids.device
+    profiler = DecodeProfiler(device, enabled=profile)
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + int(max_new_tokens)
 
@@ -342,19 +347,20 @@ def generate_decoding_sample(
     position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
     past_key_values_target = DynamicCache()
 
-    output = target_model(
-        input_ids=input_ids,
-        position_ids=position_ids[:, :num_input_tokens],
-        past_key_values=past_key_values_target,
-        use_cache=True,
-        output_hidden_states=True,
-        logits_to_keep=1,
-    )
+    with profiler.stage("prefill"):
+        output = target_model(
+            input_ids=input_ids,
+            position_ids=position_ids[:, :num_input_tokens],
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=capture_hidden_states,
+            logits_to_keep=1,
+        )
 
-    output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample_from_probs(
-        logits_to_probs(output.logits, float(temperature))
-    )
+        output_ids[:, :num_input_tokens] = input_ids
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample_from_probs(
+            logits_to_probs(output.logits, float(temperature))
+        )
 
     start = input_ids.shape[1]
     acceptance_lengths: list[int] = []
@@ -373,8 +379,10 @@ def generate_decoding_sample(
             proposal_lengths=proposal_lengths,
             accepted_draft_lengths=accepted_draft_lengths,
             verify_count=0,
+            **profiler.finish(),
         )
 
+    profiler.start_decode()
     context = init_context(
         initial_output=output,
         output_ids=output_ids,
@@ -383,24 +391,27 @@ def generate_decoding_sample(
     )
 
     while start < max_length:
-        proposal = propose(
-            context=context,
-            output_ids=output_ids,
-            position_ids=position_ids,
-            start=start,
-            stop_token_ids=stop_token_ids,
-        )
-        verification = verify_draft_tokens(
-            target_model=target_model,
-            proposal=proposal,
-            position_ids=position_ids,
-            start=start,
-            past_key_values_target=past_key_values_target,
-            temperature=temperature,
-            max_proposal_tokens=max_proposal_tokens,
-            current_token_ids=output_ids[:, start : start + 1],
-            stop_token_ids=stop_token_ids,
-        )
+        with profiler.stage("draft"):
+            proposal = propose(
+                context=context,
+                output_ids=output_ids,
+                position_ids=position_ids,
+                start=start,
+                stop_token_ids=stop_token_ids,
+            )
+        with profiler.stage("verify"):
+            verification = verify_draft_tokens(
+                target_model=target_model,
+                proposal=proposal,
+                position_ids=position_ids,
+                start=start,
+                past_key_values_target=past_key_values_target,
+                temperature=temperature,
+                max_proposal_tokens=max_proposal_tokens,
+                current_token_ids=output_ids[:, start : start + 1],
+                stop_token_ids=stop_token_ids,
+                capture_hidden_states=capture_hidden_states,
+            )
         if post_verify is not None:
             post_verify(proposal, verification)
 
@@ -438,6 +449,7 @@ def generate_decoding_sample(
         proposal_lengths=proposal_lengths,
         accepted_draft_lengths=accepted_draft_lengths,
         verify_count=len(proposal_lengths),
+        **profiler.finish(),
     )
 
 
@@ -501,7 +513,18 @@ class BaseEvaluator:
                 accept_rates_by_position.append(
                     accepted_at_pos[pos_idx] / position_proposal_count
                 )
+        accepted = metric_summary["accepted_at_pos"]
+        reached = [proposal_count] + list(accepted[:-1])
+        conditional_rates = [a / n if n else None for a, n in zip(accepted, reached)]
+        wall_ms = float(metric_summary.get("decode_wall_ms", 0))
+        timing = {}
+        if wall_ms > 0:
+            timing = {key: float(metric_summary[key]) for key in ("prefill_ms", "draft_ms", "verify_ms", "decode_wall_ms")}
+            timing["serial_decode_tokens_per_second"] = float(metric_summary["decode_tokens"]) * 1000 / wall_ms
+            timing["round_wall_ms"] = wall_ms / max(proposal_count, 1)
         return {
+            **timing,
+            "conditional_accept_rates_by_position": conditional_rates,
             "dataset": dataset_name,
             "num_samples": int(metric_summary["sample_count"]),
             "draft_tokens_per_proposal": draft_tokens_per_proposal,
@@ -517,7 +540,7 @@ class BaseEvaluator:
         max_samples: int | None,
     ) -> list[SimpleNamespace]:
         seed_all(int(self.args.seed))
-        dataset = load_and_process_dataset(dataset_name)
+        dataset = load_and_process_dataset(dataset_name, getattr(self.args, "dataset_root", DEFAULT_DATASET_ROOT))
 
         if max_samples is not None and len(dataset) > max_samples:
             rng = random.Random(int(self.args.seed))
@@ -538,6 +561,14 @@ class BaseEvaluator:
                 enable_thinking=False,
                 # enable_thinking=True,
             ).to(self.device)
+            if idx == self.global_rank:
+                self._warming_up = True
+                try:
+                    for _ in range(int(getattr(self.args, "warmup_samples", 0))):
+                        self.generate_one_sample(input_ids=input_ids, stop_token_ids=stop_token_ids)
+                finally:
+                    self._warming_up = False
+                seed_all(int(self.args.seed) + idx)
             responses.append(
                 self.generate_one_sample(
                     input_ids=input_ids,
@@ -616,7 +647,13 @@ class BaseEvaluator:
         )
         if position_tensor.numel() > 0:
             dist.all_reduce(position_tensor, op=dist.ReduceOp.SUM)
+        timing_names = ("prefill_ms", "draft_ms", "verify_ms", "decode_wall_ms")
+        timing_values = [sum(float(getattr(r, name, 0.0)) for r in responses) for name in timing_names]
+        timing_values.append(sum(max(int(r.num_output_tokens) - 1, 0) for r in responses))
+        timing_tensor = torch.tensor(timing_values, device=self.device, dtype=torch.float64)
+        dist.all_reduce(timing_tensor, op=dist.ReduceOp.SUM)
         return {
+            **dict(zip((*timing_names, "decode_tokens"), timing_tensor.tolist())),
             "sample_count": int(scalar_tensor[0].item()),
             "proposal_count": int(scalar_tensor[1].item()),
             "acceptance_length_sum": int(scalar_tensor[2].item()),
@@ -726,3 +763,4 @@ class BaseEvaluator:
 
     def clean_up(self) -> None:
         dist.destroy_process_group()
+

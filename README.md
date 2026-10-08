@@ -30,6 +30,9 @@ See [scripts/data/README.md](./scripts/data/README.md) for the step-by-step data
 
 ## Training
 
+For Qwen3 depth/loop experiments (5L, 15L, shared 5L x 3) with existing target
+cache, see [LoopDFlash / LoopDSpark pilot](docs/loopd_flash.md).
+
 ```bash
 bash scripts/train/train.sh
 ```
@@ -97,3 +100,4 @@ We thank the authors and maintainers of these projects. Contributions of new alg
       url={https://arxiv.org/abs/2607.05147}, 
 }
 ```
+

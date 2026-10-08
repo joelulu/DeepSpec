@@ -38,6 +38,16 @@ def build_draft_config(
     draft_config.architectures = ["Qwen3DSparkModel"]
     draft_config.num_target_layers = num_target_layers
     draft_config.num_hidden_layers = num_draft_layers
+    draft_config.num_loops = int(model_args.get("num_loops", 1))
+    if draft_config.num_loops < 1:
+        raise ValueError("num_loops must be >= 1")
+    draft_config.loop_loss_weights = list(model_args.get(
+        "loop_loss_weights", [1.0] * draft_config.num_loops
+    ))
+    if len(draft_config.loop_loss_weights) != draft_config.num_loops:
+        raise ValueError("loop_loss_weights must have one entry per loop")
+    if any(float(weight) <= 0 for weight in draft_config.loop_loss_weights):
+        raise ValueError("loop_loss_weights must be positive")
     draft_config.block_size = int(model_args.block_size)
     draft_config.tie_word_embeddings = False
     draft_config.layer_types = layer_types
@@ -59,3 +69,4 @@ def build_draft_config(
 __all__ = [
     "build_draft_config",
 ]
+

@@ -9,6 +9,7 @@ from deepspec.eval.base_evaluator import DraftProposal
 from deepspec.utils.sampling import logits_to_probs
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
+from deepspec.modeling.dspark.context_cache import ContextKVCache
 
 
 DSparkModel = Qwen3DSparkModel | Gemma4DSparkModel
@@ -24,7 +25,7 @@ def forward_dspark_draft_block(
     *,
     draft_input_ids: torch.Tensor,
     position_ids: torch.Tensor,
-    past_key_values_draft: DynamicCache,
+    past_key_values_draft: DynamicCache | ContextKVCache,
     target_hidden_states: torch.Tensor,
     start: int,
     block_size: int,
@@ -32,6 +33,9 @@ def forward_dspark_draft_block(
     draft_position_ids = position_ids[
         :, past_key_values_draft.get_seq_length() : start + block_size
     ]
+    backbone_kwargs = {}
+    if isinstance(model, Qwen3DSparkModel):
+        backbone_kwargs["num_loops"] = getattr(model, "eval_num_loops", model.num_loops)
     block_hidden = model._forward_backbone(
         target_hidden_states=target_hidden_states,
         noise_embedding=model.embed_tokens(draft_input_ids),
@@ -40,7 +44,11 @@ def forward_dspark_draft_block(
         past_key_values=past_key_values_draft,
         use_cache=True,
         is_causal=False,
+        **backbone_kwargs,
     )
+    if isinstance(past_key_values_draft, ContextKVCache):
+        if any(pair[0].shape[-2] != start for pair in past_key_values_draft.layers.values()):
+            raise RuntimeError("Context cache must end before the current anchor")
     past_key_values_draft.crop(start)
     return block_hidden
 
@@ -151,3 +159,4 @@ def build_dspark_proposal(
             else None
         ),
     )
+

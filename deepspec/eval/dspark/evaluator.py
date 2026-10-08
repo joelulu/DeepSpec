@@ -22,6 +22,7 @@ from deepspec.eval.dspark.draft_ops import (
 from deepspec.modeling.dspark.common import extract_context_feature
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
+from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.utils import jsonable
 
 
@@ -77,6 +78,14 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             dtype=torch.bfloat16,
             attn_implementation=self.EVAL_ATTN_IMPLEMENTATION,
         ).to(self.device).eval()
+        requested_loops = getattr(self.args, "num_loops", None)
+        if requested_loops is not None:
+            maximum = int(getattr(draft_model, "num_loops", 1))
+            if not 1 <= requested_loops <= maximum:
+                raise ValueError(f"--num-loops must be in [1, {maximum}]")
+            if not isinstance(draft_model, Qwen3DSparkModel):
+                raise ValueError("Loop evaluation currently supports Qwen3 only")
+            draft_model.eval_num_loops = int(requested_loops)
         assert_no_final_target_layer(target_model, draft_model.target_layer_ids)
         assert 0.0 <= float(self.args.confidence_threshold) <= 1.0
         tokenizer = AutoTokenizer.from_pretrained(self.args.target_name_or_path)
@@ -89,7 +98,9 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
         **kwargs,
     ) -> SimpleNamespace:
         return SimpleNamespace(
-            past_key_values_draft=DynamicCache(),
+            past_key_values_draft=(
+                ContextKVCache() if isinstance(self.draft_model, Qwen3DSparkModel) else DynamicCache()
+            ),
             target_hidden_states=extract_context_feature(
                 initial_output.hidden_states,
                 self.draft_model.target_layer_ids,
@@ -151,7 +162,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
         proposal: DraftProposal,
         verification: VerificationResult,
     ) -> None:
-        if self.confidence_head_recorder is None:
+        if self.confidence_head_recorder is None or getattr(self, "_warming_up", False):
             return
         assert isinstance(proposal, DSparkDraftProposal)
         self.confidence_head_recorder.observe(
@@ -176,6 +187,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             propose=self._propose,
             update=self._update,
             post_verify=self._post_verify,
+            profile=bool(getattr(self.args, "profile", False)),
         )
 
     def evaluate(self) -> None:
@@ -223,3 +235,4 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
 
 class Gemma4DSparkEvaluator(Qwen3DSparkEvaluator):
     draft_model_cls = Gemma4DSparkModel
+
