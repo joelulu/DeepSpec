@@ -2,6 +2,7 @@ import random
 import torch
 
 from deepspec.data import CacheCollator
+from deepspec.data.cuda_prefetcher import move_batch_to_device
 from deepspec.utils.metrics import add_metric
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.gemma4.config import (
@@ -96,7 +97,7 @@ class Qwen3DSparkTrainer(BaseTrainer):
                     index %= len(dataset)
                     torch.manual_seed(int(self.args.seed) + int(dataset.source_ids[index]) + 209759)
                     batch = self.data_collator_cls()([dataset[index]])
-                    batch = {key: value.to(self.device) for key, value in batch.items()}
+                    batch = move_batch_to_device(batch, self.device)
                     outputs = self.model(input_ids=batch["input_ids"],
                         target_hidden_states=batch["target_hidden_states"], loss_mask=batch["loss_mask"],
                         target_last_hidden_states=None)

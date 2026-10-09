@@ -5,7 +5,8 @@ import torch
 
 def move_batch_to_device(batch, device):
     moved = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-    # Embedding lookup requires int64; cast on GPU to avoid bloating CPU-to-GPU transfer.
+    # Noise-token assignment and class-index CE labels use int64. Cast after
+    # transfer to keep cached int32 IDs small during CPU-to-GPU copies.
     if moved["input_ids"].dtype != torch.long:
         moved["input_ids"] = moved["input_ids"].to(torch.long)
     return moved

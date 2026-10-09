@@ -166,7 +166,7 @@ def test_prefix_summary_supports_arbitrary_depth_and_matches_bruteforce(count):
     assert result['aggregate_oracle_progress_per_second_proxy']==pytest.approx(brute)
 
 
-def test_real_trainer_final_loss_and_validation_are_deterministic_and_isolated(monkeypatch):
+def test_real_trainer_final_loss_and_validation_are_deterministic_and_isolated(monkeypatch, tmp_path):
     import torch.distributed as dist
     import deepspec.modeling.dspark.qwen3.modeling as modeling
     from deepspec.trainer.dspark_trainer import Qwen3DSparkTrainer
@@ -195,16 +195,39 @@ def test_real_trainer_final_loss_and_validation_are_deterministic_and_isolated(m
     assert metrics._metrics['train/loop2/weighted_contribution']['values'][0].item()==0
     assert metrics._metrics['train/objective']['values'][0].item()==pytest.approx(loss.item())
     assert all(f'train/loop{i}/ce_unweighted' in metrics._metrics for i in (1,2,3))
-    class Held:
-        source_ids=np.array([2,7,9])
-        def __len__(self): return 3
-        def __getitem__(self,index): return {key:value[0].clone() for key,value in batch.items()}
-    trainer.validation_dataset=Held()
+    # Exercise the writer -> reader -> collator path: real caches store int32
+    # token IDs and bfloat16 features, unlike torch.randint's int64 default.
+    cache_path=tmp_path/'validation_cache'; cache_path.mkdir()
+    writer=LocalTargetCacheWriter(rank_dir=str(cache_path), max_shard_bytes=65536)
+    for index in range(10):
+        writer.write_sample(sample_id=index, attention_mask=torch.ones(12),
+            **{key:value[0] for key,value in batch.items()})
+    writer.close()
+    (cache_path/'samples.local.idx').rename(cache_path/'samples.idx')
+    manifest=build_target_cache_manifest(num_samples=10,
+        shards=[dict(shard_id=i,file_name=name) for i,name in enumerate(writer.local_shard_files)],
+        target_layer_ids=[0,2],hidden_size=32)
+    write_target_cache_manifest(output_dir=str(cache_path),manifest=manifest)
+    held=CacheDataset(str(cache_path),data_percent=100,holdout_samples=3,split='validation')
+    assert held[0]['input_ids'].dtype==torch.int32
+    model.to(torch.bfloat16)
+    trainer.validation_dataset=held
     previous_schema=metrics._schema(); collected=[]
     monkeypatch.setattr(training_logger,'log_validation',lambda values,**kwargs:collected.append(values))
     rng_before=torch.get_rng_state().clone()
     trainer.evaluate_cache(); trainer.evaluate_cache()
     assert collected[0]==collected[1]
+    class LongHeld:
+        source_ids=held.source_ids
+        def __len__(self): return len(held)
+        def __getitem__(self,index):
+            sample=held[index]
+            return {**sample,'input_ids':sample['input_ids'].long()}
+    trainer.validation_dataset=LongHeld()
+    trainer.evaluate_cache()
+    assert collected[0]==collected[2]
+    assert held[0]['input_ids'].dtype==torch.int32
+    held.close()
     assert collected[0]['validation/tokens']>0
     assert all(collected[0][f'validation/loop{i}/ce_unweighted']>0 for i in (1,2,3))
     assert torch.equal(rng_before,torch.get_rng_state())
