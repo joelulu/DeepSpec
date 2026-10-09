@@ -12,3 +12,5 @@ dist/
 deepspec/utils/constant/internal.py
 __pycache__/
 runs/
+cache/
+loop_3pct_update/

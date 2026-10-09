@@ -33,6 +33,23 @@ See [scripts/data/README.md](./scripts/data/README.md) for the step-by-step data
 For Qwen3 depth/loop experiments (5L, 15L, shared 5L x 3) with existing target
 cache, see [LoopDFlash / LoopDSpark pilot](docs/loopd_flash.md).
 
+The fixed 3% DFlash pilot and same-prefix depth diagnostic are documented in
+[3% training and depth comparison](docs/loop_3pct_pilot.md). The launchers use
+`scripts/loop/settings_3pct.sh` for all paths and budgets:
+
+```bash
+bash smoke_dflash_loop.sh
+bash train_dflash_loop.sh 5l
+bash train_dflash_loop.sh 15l
+bash train_dflash_loop.sh loop5x3
+bash eval_dflash_loop.sh fixed
+bash eval_dflash_loop.sh prefix
+```
+
+Training automatically builds/reuses the same seed-42 random 3% cache subset.
+Tensor shards are referenced by symlink; the original cache is unchanged.
+Same-prefix oracle results are offline utility proxies, not dynamic-exit speedups.
+
 ```bash
 bash scripts/train/train.sh
 ```
