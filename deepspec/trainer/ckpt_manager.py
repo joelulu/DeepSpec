@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import shutil
 from dataclasses import dataclass
@@ -20,6 +21,18 @@ from deepspec.utils import (
 
 
 TRAIN_CONFIG_FILE_NAME = "train_config.py"
+CHECKPOINT_META_FILE_NAME = "checkpoint_meta.json"
+
+
+def _completed_model_state(checkpoint_dir):
+    path = os.path.join(checkpoint_dir, CHECKPOINT_META_FILE_NAME)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if metadata.get("training_complete") is True and metadata.get("save_training_state") is False:
+        return metadata
+    return None
 
 
 def discover_latest_checkpoint(checkpoint_dir):
@@ -70,7 +83,8 @@ def load_resume_draft_model(
     global_rank: int,
 ):
     state_path = _rank_training_state_path(resume_checkpoint_dir, global_rank)
-    assert os.path.exists(state_path)
+    if not os.path.exists(state_path) and _completed_model_state(resume_checkpoint_dir) is None:
+        raise ValueError(f"No resumable training state in {resume_checkpoint_dir}; use a new RUN_ROOT for a fresh run.")
     resumed_model = type(draft_model).from_pretrained(
         resume_checkpoint_dir,
         dtype=precision_dtype,
@@ -98,7 +112,14 @@ def load_training_state(
     micro_batches_per_epoch: int,
 ) -> TrainingResumeState:
     state_path = _rank_training_state_path(resume_checkpoint_dir, global_rank)
-    assert os.path.exists(state_path)
+    if not os.path.exists(state_path):
+        metadata = _completed_model_state(resume_checkpoint_dir)
+        if metadata is None:
+            raise ValueError(f"No resumable training state in {resume_checkpoint_dir}; use a new RUN_ROOT for a fresh run.")
+        next_micro_step = int(metadata["next_micro_step"])
+        assert next_micro_step % gradient_accumulation_steps == 0
+        print_on_global_main(f"Training already completed at {resume_checkpoint_dir}; no optimizer state to restore.")
+        return TrainingResumeState(next_micro_step=next_micro_step)
 
     checkpoint = torch.load(state_path, map_location="cpu", weights_only=False)
     optimizer.load_state_dict(checkpoint["optimizer"])
@@ -151,6 +172,8 @@ def save_checkpoint(
     global_rank: int,
     world_size: int,
     local_batch_size: int,
+    save_training_state: bool = True,
+    training_complete: bool = False,
 ) -> str:
     assert next_micro_step % gradient_accumulation_steps == 0, (
         "next_micro_step must be aligned with gradient_accumulation_steps at "
@@ -168,20 +191,27 @@ def save_checkpoint(
         draft_model=draft_model,
         checkpoint_dir=checkpoint_dir,
     )
-    training_state = _serialize_training_state(
-        optimizer=optimizer,
-        next_micro_step=next_micro_step,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        global_rank=global_rank,
-        world_size=world_size,
-        local_batch_size=local_batch_size,
-    )
-    torch.save(
-        training_state,
-        _rank_training_state_path(checkpoint_dir, global_rank),
-    )
+    if save_training_state:
+        training_state = _serialize_training_state(
+            optimizer=optimizer,
+            next_micro_step=next_micro_step,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            global_rank=global_rank,
+            world_size=world_size,
+            local_batch_size=local_batch_size,
+        )
+        torch.save(
+            training_state,
+            _rank_training_state_path(checkpoint_dir, global_rank),
+        )
     dist.barrier()
     if is_global_main_process():
+        if not save_training_state:
+            # A small completion marker lets a finished queue skip this run
+            # without storing optimizer tensors or RNG state.
+            with open(os.path.join(checkpoint_dir, CHECKPOINT_META_FILE_NAME), "w", encoding="utf-8") as handle:
+                json.dump(dict(training_complete=bool(training_complete), save_training_state=False,
+                    next_micro_step=int(next_micro_step), global_step=global_step), handle)
         safe_symlink(
             checkpoint_dir,
             os.path.join(checkpoint_dir_root, "step_latest"),

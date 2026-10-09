@@ -61,7 +61,9 @@ def build_launch(layers, loops, env):
     plan = dict(experiment=name, source_cache=str(source), data_percent=percent, train_samples=count,
         holdout_samples=held, visible_gpus=env.get("CUDA_VISIBLE_DEVICES", ""), layers=layers, loops=loops, transfer=transfer, loss_weights=weights,
         local_batch=local, global_batch=batch, epochs=epochs, steps_per_epoch=steps_per_epoch,
-        max_train_steps=smoke_steps or epochs * steps_per_epoch, checkpoint_every=smoke_steps or steps_per_epoch,
+        max_train_steps=smoke_steps or epochs * steps_per_epoch,
+        checkpoint_every=smoke_steps or epochs * steps_per_epoch,
+        validation_every=smoke_steps or steps_per_epoch,
         smoke=bool(smoke_steps),
         checkpoint_root=f"{root}/deepspec/{name}", tensorboard=f"{root}/tensorboard/deepspec/{name}")
     return plan, command, opts

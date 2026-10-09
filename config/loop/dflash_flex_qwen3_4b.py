@@ -52,6 +52,8 @@ logging = dict(
     logging_steps=5,
     diagnostic_steps=20,
     checkpointing_steps=100,
+    save_only_final=True,
+    save_training_state=False,
 )
 
 data = dict(

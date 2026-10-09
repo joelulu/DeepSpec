@@ -74,12 +74,14 @@ def test_flex_launch_epoch_schedule_and_real_config(tmp_path):
     plan, command, opts = load_script('launch_flex').build_launch(1, 5, env)
     assert plan['train_samples'] == 40192
     assert plan['steps_per_epoch'] == 157 and plan['max_train_steps'] == 471
+    assert plan['checkpoint_every'] == 471 and plan['validation_every'] == 157
     assert plan['loss_weights'] == [0,0,0,0,1]
     root = Path(__file__).resolve().parents[1]
     cfg = parse_opts_to_config([key+'='+json.dumps(value) for key,value in opts.items()],
         load_config(root/'config/loop/dflash_flex_qwen3_4b.py'))
     assert cfg.model.num_draft_layers == 1 and cfg.model.num_loops == 5
     assert cfg.model.loop_boundary_norm and cfg.train.max_train_steps is None
+    assert cfg.logging.save_only_final and not cfg.logging.save_training_state
     schedule = _compute_training_schedule(world_size=8, dataset_size=plan['train_samples'],
         local_batch_size=4, global_batch_size=256, num_train_epochs=3)
     assert schedule[0] == 8 and schedule[4:6] == (157,471)

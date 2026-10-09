@@ -15,8 +15,10 @@ bash eval_temp.sh               # AR and every trained loop depth in the five gr
 The queue is: 5x1 raw, 15x1 raw, 1x5 raw, 5x3 raw, 5x3 rmsnorm.
 All use final-exit loss, three epochs and the same samples/anchors.
 `run_dflash_experiments.sh` explicitly selects GPUs 0-7; `MATRIX_GPUS` overrides
-that list. It stops on a failed job. Completed groups are recognized on rerun
-and unfinished groups resume only with identical settings.
+that list. It stops on a failed job. Completed groups are recognized on rerun.
+By default only the final model is saved, without optimizer/RNG `.pt` files;
+interrupted runs therefore restart from scratch. Legacy checkpoints with
+training state can still resume with identical settings.
 
 Individual training takes exactly two integers:
 
@@ -48,7 +50,8 @@ training samples are used. Too-small selections fail before CUDA training.
 
 With 1,339,767 source samples, the default holds out 32 and selects 40,192
 training samples. Global batch 256 gives 157 steps per epoch, 471 steps total,
-and saves at 157/314/471. Eight GPUs x local batch 4 implies accumulation 8.
+and validates at 157/314/471, saving only the final model at 471. Eight GPUs x
+local batch 4 implies accumulation 8.
 The last incomplete global batch is dropped each epoch as in the original
 trainer; shuffling changes its membership between epochs.
 
@@ -94,8 +97,15 @@ TensorBoard: `RUN_ROOT/tensorboard/deepspec/<experiment>`.
   diagnostics, not proof of convergence.
 - `train/lr`, `train/grad_norm`: LR and global gradient norm before clipping.
 - `validation/loopN/ce_unweighted`: token-weighted CE on the fixed holdout,
-  same deterministic anchors per sample; evaluated at each save. This small
+  same deterministic anchors per sample; evaluated each epoch and at the final save. This small
   cache check measures teacher-forced block loss, not generation throughput.
+
+`config/loop/dflash_flex_qwen3_4b.py` sets `logging.save_only_final=True` and
+`logging.save_training_state=False`. The final `step_<N>` model directory is
+linked from `step_latest`, so evaluation commands are unchanged. A small
+`checkpoint_meta.json` records completion for queue reruns; it contains no
+optimizer tensors or RNG state. Existing checkpoint directories are not deleted.
+Other training configs retain their original saving/resume behavior by default.
 
 `eval_temp.sh` accepts zero or more checkpoint paths, reads maximum loops from
 config, runs all valid depths, and uses a fresh output directory. Default:

@@ -349,6 +349,8 @@ class BaseTrainer:
             global_rank=self.global_rank,
             world_size=self.world_size,
             local_batch_size=int(self.args.train.local_batch_size),
+            save_training_state=bool(self.args.logging.get("save_training_state", True)),
+            training_complete=self.global_step >= self.max_train_steps,
         )
 
     def save_and_eval_checkpoint(self):
@@ -356,6 +358,8 @@ class BaseTrainer:
             return
         if self.args.data.get("holdout_samples", 0) and hasattr(self, "evaluate_cache"):
             self.evaluate_cache()
+        if self.args.logging.get("save_only_final", False) and self.global_step < self.max_train_steps:
+            return
         checkpoint_dir = save_checkpoint(**self._checkpoint_kwargs())
         self._last_saved_step = self.global_step
         if is_global_main_process():
@@ -370,8 +374,11 @@ class BaseTrainer:
         return checkpoint_dir
 
     def _save_and_suspend(self):
-        print_on_global_main("Saving checkpoint before suspending...")
-        save_checkpoint(**self._checkpoint_kwargs())
+        if self.args.logging.get("save_only_final", False):
+            print_on_global_main("Final-only saving: suspending without a recovery checkpoint.")
+        else:
+            print_on_global_main("Saving checkpoint before suspending...")
+            save_checkpoint(**self._checkpoint_kwargs())
         dist.barrier()
         if is_global_main_process():
             print_on_global_main("Going to suspend...")
