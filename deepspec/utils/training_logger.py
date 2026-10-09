@@ -81,7 +81,7 @@ def _print_summary(
     session_start_wall = _session_start_wall
     if session_start_wall is None:
         session_start_wall = time.time()
-    current_epoch = next_micro_step // micro_batches_per_epoch + 1
+    current_epoch = (max(next_micro_step, 1) - 1) // micro_batches_per_epoch + 1
     session_elapsed = time.time() - session_start_wall
     completed_session_steps = global_step - _session_start_step
     remaining_steps = max(max_train_steps - global_step, 0)
@@ -89,8 +89,15 @@ def _print_summary(
         session_elapsed * remaining_steps / max(completed_session_steps, 1)
     ) / 60
     loss_text = ""
-    if "train/loss" in summary:
-        loss_text = f" loss={summary['train/loss']:.4f}"
+    objective = summary.get("train/objective", summary.get("train/loss"))
+    if objective is not None:
+        loss_text = f" loss={objective:.4f}"
+    details = [f"{key}={value:.4f}" for key, value in sorted(summary.items())
+               if key.endswith(("/ce_unweighted", "/weighted_contribution", "/hidden_rms", "/relative_update"))]
+    if "train/lr" in summary:
+        details.append(f"lr={summary['train/lr']:.3g}")
+    if "train/grad_norm" in summary:
+        details.append(f"grad_norm={summary['train/grad_norm']:.3g}")
     print_on_global_main(
         f"epoch={current_epoch} "
         f"step={global_step}/{max_train_steps}"
@@ -98,3 +105,12 @@ def _print_summary(
         f"| elapsed={session_elapsed / 60:.1f}min"
         f" | remaining={remaining_min:.1f}min"
     )
+    if details:
+        print_on_global_main("  " + " | ".join(details))
+
+
+def log_validation(summary, *, global_step):
+    if is_global_main_process():
+        _write_scalars(summary, global_step=global_step)
+        print_on_global_main(f"validation step={global_step}: " + " | ".join(
+            f"{key}={value:.4f}" for key, value in sorted(summary.items())))

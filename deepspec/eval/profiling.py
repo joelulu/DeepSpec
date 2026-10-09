@@ -11,6 +11,9 @@ class DecodeProfiler:
         self.enabled = enabled
         self.events = {name: [] for name in ("prefill", "draft", "verify")}
         self.decode_start = None
+        if self.enabled and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.generation_start = time.perf_counter() if self.enabled else None
 
     @contextmanager
     def stage(self, name):
@@ -40,7 +43,8 @@ class DecodeProfiler:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         elapsed = 0.0 if self.decode_start is None else (time.perf_counter() - self.decode_start) * 1000
-        result = {"decode_wall_ms": elapsed}
+        result = {"decode_wall_ms": elapsed,
+                  "generation_wall_ms": (time.perf_counter() - self.generation_start) * 1000}
         for name, pairs in self.events.items():
             result[f"{name}_ms"] = sum(
                 start.elapsed_time(end) if self.device.type == "cuda" else (end - start) * 1000

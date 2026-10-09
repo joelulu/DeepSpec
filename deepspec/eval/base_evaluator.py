@@ -522,6 +522,10 @@ class BaseEvaluator:
             timing = {key: float(metric_summary[key]) for key in ("prefill_ms", "draft_ms", "verify_ms", "decode_wall_ms")}
             timing["serial_decode_tokens_per_second"] = float(metric_summary["decode_tokens"]) * 1000 / wall_ms
             timing["round_wall_ms"] = wall_ms / max(proposal_count, 1)
+        generation_ms = float(metric_summary.get("generation_wall_ms", 0))
+        if generation_ms > 0:
+            timing["generation_wall_ms"] = generation_ms
+            timing["serial_generation_tokens_per_second"] = float(metric_summary["generated_tokens"]) * 1000 / generation_ms
         return {
             **timing,
             "conditional_accept_rates_by_position": conditional_rates,
@@ -647,13 +651,14 @@ class BaseEvaluator:
         )
         if position_tensor.numel() > 0:
             dist.all_reduce(position_tensor, op=dist.ReduceOp.SUM)
-        timing_names = ("prefill_ms", "draft_ms", "verify_ms", "decode_wall_ms")
+        timing_names = ("prefill_ms", "draft_ms", "verify_ms", "decode_wall_ms", "generation_wall_ms")
         timing_values = [sum(float(getattr(r, name, 0.0)) for r in responses) for name in timing_names]
         timing_values.append(sum(max(int(r.num_output_tokens) - 1, 0) for r in responses))
+        timing_values.append(sum(int(r.num_output_tokens) for r in responses))
         timing_tensor = torch.tensor(timing_values, device=self.device, dtype=torch.float64)
         dist.all_reduce(timing_tensor, op=dist.ReduceOp.SUM)
         return {
-            **dict(zip((*timing_names, "decode_tokens"), timing_tensor.tolist())),
+            **dict(zip((*timing_names, "decode_tokens", "generated_tokens"), timing_tensor.tolist())),
             "sample_count": int(scalar_tensor[0].item()),
             "proposal_count": int(scalar_tensor[1].item()),
             "acceptance_length_sum": int(scalar_tensor[2].item()),

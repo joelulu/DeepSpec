@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from deepspec.data.parser import preprocess_record
+from deepspec.data.cache_selection import select_cache_ids, selection_identity
 
 
 TARGET_CACHE_VERSION = 2
@@ -613,11 +614,17 @@ def cleanup_target_cache_tmp_dir(output_dir: str):
 
 
 class CacheDataset(torch.utils.data.Dataset):
-    def __init__(self, cache_dir: str, max_open_shards: int = 4):
+    def __init__(self, cache_dir: str, max_open_shards: int = 4, *,
+                 data_percent=100, subset_seed=42, holdout_samples=0, split="train"):
         super().__init__()
         self.cache_dir = os.path.abspath(cache_dir)
         self.manifest = load_target_cache_manifest(self.cache_dir)
-        self.num_samples = int(self.manifest["num_samples"])
+        self.source_num_samples = int(self.manifest["num_samples"])
+        self.source_ids = select_cache_ids(self.source_num_samples, data_percent,
+            int(subset_seed), int(holdout_samples), split)
+        self.num_samples = self.source_num_samples if self.source_ids is None else len(self.source_ids)
+        self.selection_id = selection_identity(self.cache_dir, self.manifest, self.source_ids,
+            percent=data_percent, seed=subset_seed, holdout_samples=holdout_samples, split=split)
         self.hidden_size = int(self.manifest["hidden_size"])
         self.target_layer_ids = [int(layer_id) for layer_id in self.manifest["target_layer_ids"]]
         self.num_target_layers = len(self.target_layer_ids)
@@ -695,8 +702,11 @@ class CacheDataset(torch.utils.data.Dataset):
         return self.shard_mmaps[shard_id]
 
     def _read_record(self, index: int):
+        if not 0 <= int(index) < self.num_samples:
+            raise IndexError(index)
+        index = int(index) if self.source_ids is None else int(self.source_ids[int(index)])
         self._ensure_index_mmap()
-        offset = int(index) * INDEX_RECORD_SIZE
+        offset = index * INDEX_RECORD_SIZE
         record = unpack_index_record(self.index_mmap, offset)
         assert int(record["sample_id"]) == int(index), (
             "Target cache index is not sorted by sample_id or sample ids are not dense: "

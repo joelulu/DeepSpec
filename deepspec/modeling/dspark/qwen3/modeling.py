@@ -281,6 +281,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         if self.num_loops < 1:
             raise ValueError("num_loops must be >= 1")
 
+        self.loop_boundary_norm = bool(getattr(config, "loop_boundary_norm", False))
+
         # Markov head.
         self.markov_head = build_markov_head(config)
 
@@ -404,6 +406,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         return_all_loop_hidden: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        diagnostics = kwargs.pop("diagnostics", False)
+        diagnostic_mask = kwargs.pop("diagnostic_mask", None)
         hidden_states = noise_embedding
         target_hidden_states = self.hidden_norm(self.fc(target_hidden_states))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -424,7 +428,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                     pair = context_cache.update(*pair, index)
                 projected.append(pair)
         exits = []
-        for _ in range(loops):
+        for loop_index in range(loops):
+            previous = hidden_states.detach() if diagnostics else None
             for index, layer in enumerate(self.layers):
                 layer_kwargs = dict(kwargs)
                 if projected is not None:
@@ -439,9 +444,22 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                     position_embeddings=position_embeddings,
                     **layer_kwargs,
                 )
+            exit_hidden = self.norm(hidden_states) if return_all_loop_hidden or self.loop_boundary_norm or loop_index == loops - 1 else None
+            if diagnostics:
+                from deepspec.utils.metrics import add_metric
+                with torch.no_grad():
+                    current, prev = hidden_states.float(), previous.float()
+                    if diagnostic_mask is not None:
+                        current, prev = current[diagnostic_mask], prev[diagnostic_mask]
+                    tag = f"state/loop{loop_index + 1}"
+                    mean_square = current.square().mean() if current.numel() else current.new_zeros(())
+                    add_metric("hidden_rms", mean_square.sqrt(), reduction="dp_mean", tag=tag)
+                    add_metric("relative_update", ((current - prev).square().sum() / prev.square().sum().clamp_min(1e-12)).sqrt(), reduction="dp_mean", tag=tag)
             if return_all_loop_hidden:
-                exits.append(self.norm(hidden_states))
-        return tuple(exits) if return_all_loop_hidden else self.norm(hidden_states)
+                exits.append(exit_hidden)
+            if self.loop_boundary_norm:
+                hidden_states = exit_hidden
+        return tuple(exits) if return_all_loop_hidden else exit_hidden
 
     def forward(
         self,
@@ -450,6 +468,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         loss_mask: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
         num_loops: Optional[int] = None,
+        diagnostics: bool = False,
     ) -> DSparkForwardOutput | tuple[DSparkForwardOutput, ...]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -485,6 +504,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             attention_mask=dspark_attn_mask,
             num_loops=num_loops,
             return_all_loop_hidden=True,
+            diagnostics=diagnostics,
+            diagnostic_mask=block_keep_mask.repeat_interleave(self.block_size, dim=1),
         )
 
         num_blocks = anchor_positions.size(1)
@@ -548,7 +569,11 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             num_anchors=self.num_anchors,
         )
         outputs = []
-        for output_hidden in output_hiddens:
+        for exit_index, output_hidden in enumerate(output_hiddens):
+            weights = getattr(self.config, "loop_loss_weights", [1.0] * self.num_loops)
+            # Monitoring an unsupervised exit must not retain a vocabulary-sized graph.
+            if self.training and float(weights[exit_index]) == 0:
+                output_hidden = output_hidden.detach()
             output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
             draft_logits = self.compute_logits(output_hidden).reshape(
                 bsz, num_blocks, self.block_size, -1

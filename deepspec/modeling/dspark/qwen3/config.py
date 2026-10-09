@@ -1,4 +1,5 @@
 import copy
+import math
 
 from deepspec.modeling.dspark.common import validate_target_layer_ids
 
@@ -12,6 +13,8 @@ def build_draft_config(
 ):
     num_target_layers = int(target_config.num_hidden_layers)
     num_draft_layers = int(model_args.num_draft_layers)
+    if num_draft_layers < 1:
+        raise ValueError("num_draft_layers must be >= 1")
     layer_types = ["full_attention"] * num_draft_layers
     assert "target_layer_ids" in model_args, "target_layer_ids must be provided."
     target_layer_ids = validate_target_layer_ids(
@@ -46,8 +49,11 @@ def build_draft_config(
     ))
     if len(draft_config.loop_loss_weights) != draft_config.num_loops:
         raise ValueError("loop_loss_weights must have one entry per loop")
-    if any(float(weight) <= 0 for weight in draft_config.loop_loss_weights):
-        raise ValueError("loop_loss_weights must be positive")
+    if any(not math.isfinite(float(w)) or float(w) < 0 for w in draft_config.loop_loss_weights) or sum(draft_config.loop_loss_weights) <= 0:
+        raise ValueError("loop_loss_weights must be finite, nonnegative, with positive sum")
+    if model_args.get("sample_loop_count", False) and draft_config.loop_loss_weights[0] <= 0:
+        raise ValueError("sample_loop_count requires a positive first loop loss weight")
+    draft_config.loop_boundary_norm = bool(model_args.get("loop_boundary_norm", False))
     draft_config.block_size = int(model_args.block_size)
     draft_config.tie_word_embeddings = False
     draft_config.layer_types = layer_types

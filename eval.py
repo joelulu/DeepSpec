@@ -91,6 +91,8 @@ def main(local_rank: int, args):
             args=vars(args),
             num_draft_layers=0 if args.autoregressive else evaluator.draft_model.config.num_hidden_layers,
             num_loops=0 if args.autoregressive else getattr(evaluator.draft_model, "eval_num_loops", getattr(evaluator.draft_model, "num_loops", 1)),
+            loop_boundary_norm=False if args.autoregressive else getattr(evaluator.draft_model.config, "loop_boundary_norm", False),
+            loop_loss_weights=[] if args.autoregressive else getattr(evaluator.draft_model.config, "loop_loss_weights", [1.0]),
             device_name=torch.cuda.get_device_name(evaluator.device),
             metrics=evaluator.metrics_rows,
             timing_scope="serial requests per GPU; not a serving-throughput benchmark",

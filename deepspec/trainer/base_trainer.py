@@ -181,13 +181,19 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
+        self.trainable_parameter_count = sum(p.numel() for p in self.draft_model.parameters() if p.requires_grad)
         self.model = self.draft_model
         if self.args.train.torch_compile:
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
 
-        self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
+        selection = dict(data_percent=self.args.data.get("data_percent", 100),
+                         subset_seed=int(self.args.seed),
+                         holdout_samples=int(self.args.data.get("holdout_samples", 0)))
+        self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path, **selection)
+        self.validation_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path,
+            split="validation", **selection) if selection["holdout_samples"] else None
         validate_train_cache(
             train_dataset=self.train_dataset,
             draft_model=self.draft_model,
@@ -210,6 +216,17 @@ class BaseTrainer:
             num_train_epochs=int(self.args.train.num_train_epochs),
             max_train_steps=self.args.train.max_train_steps,
         )
+
+        if "data_percent" in self.args.data:
+            from deepspec.trainer.run_identity import check_run_identity
+            from deepspec.utils.config import config_to_plain_dict
+            identity = dict(selection=self.train_dataset.selection_id, model=config_to_plain_dict(self.args.model),
+                train={key: value for key, value in self.args.train.items() if key != "trainer_cls"},
+                seed=int(self.args.seed), world_size=self.world_size,
+                max_steps=self.max_train_steps)
+            check_run_identity(self.checkpoint_dir_root, identity,
+                resuming=self.resume_checkpoint_dir is not None, write=is_global_main_process())
+            dist.barrier()
 
         self.optimizer = BF16Optimizer(
             self.draft_model,
@@ -240,6 +257,9 @@ class BaseTrainer:
     def info_board(self):
         print_on_local_main("***** Running training *****")
         print_on_local_main(f"  Train dataset size = {len(self.train_dataset)}")
+        print_on_local_main(f"  Source samples = {self.train_dataset.source_num_samples}; data percent = {self.args.data.get('data_percent', 100)}; holdout = {len(self.validation_dataset) if self.validation_dataset is not None else 0}")
+        print_on_local_main(f"  Draft layers = {len(self.draft_model.layers)}; loops = {getattr(self.draft_model, 'num_loops', 1)}; boundary norm = {getattr(self.draft_model, 'loop_boundary_norm', False)}; loss weights = {self.args.model.get('loop_loss_weights', [1.0])}")
+        print_on_local_main(f"  Trainable parameters = {self.trainable_parameter_count:,}")
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
         print_on_local_main(f"  Local batch size = {self.args.train.local_batch_size}")
@@ -297,6 +317,7 @@ class BaseTrainer:
             dataset=self.train_dataset,
             num_replicas=self.world_size,
             rank=self.global_rank,
+            seed=int(self.args.seed),
             total_size=self.samples_per_epoch,
             start_global_offset_samples=start_offset_samples,
             num_samples=num_samples,
@@ -331,7 +352,12 @@ class BaseTrainer:
         )
 
     def save_and_eval_checkpoint(self):
+        if getattr(self, "_last_saved_step", None) == self.global_step:
+            return
+        if self.args.data.get("holdout_samples", 0) and hasattr(self, "evaluate_cache"):
+            self.evaluate_cache()
         checkpoint_dir = save_checkpoint(**self._checkpoint_kwargs())
+        self._last_saved_step = self.global_step
         if is_global_main_process():
             _launch_eval(
                 target_model_name_or_path=self.args.model.target_model_name_or_path,

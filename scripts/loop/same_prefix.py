@@ -86,16 +86,16 @@ def main():
         attn_implementation="sdpa").to(device).eval()
     draft = Qwen3DSparkModel.from_pretrained(args.draft, dtype=torch.bfloat16,
         attn_implementation="sdpa").to(device).eval()
-    if target.config.model_type != "qwen3" or draft.num_loops != 3 or draft.markov_head is not None or draft.confidence_head is not None:
-        parser.error("This diagnostic requires a Qwen3 DFlash Loop5x3 checkpoint without Markov/confidence heads")
+    if target.config.model_type != "qwen3" or draft.markov_head is not None or draft.confidence_head is not None:
+        parser.error("This diagnostic requires a Qwen3 DFlash checkpoint without Markov/confidence heads")
     assert_no_final_target_layer(target, draft.target_layer_ids)
     tokenizer = AutoTokenizer.from_pretrained(args.target)
     stop_ids = resolve_stop_token_ids(target, tokenizer)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     metadata = dict(args=vars(args) | {"output": str(args.output)}, device=torch.cuda.get_device_name(device),
-        temperature=0, num_draft_layers=len(draft.layers), rollout_num_loops=3,
+        temperature=0, num_draft_layers=len(draft.layers), rollout_num_loops=draft.num_loops,
         timing_scope="median synchronized proposal+verification+context bookkeeping wall time; no prefill, probe reset, trace IO or gate overhead",
-        interpretation="offline utility proxy on loop3 prefixes; oracle uses future information and is not deployed speedup")
+        interpretation="offline utility proxy on maximum-loop prefixes; oracle uses future information and is not deployed speedup")
     args.output.with_suffix(".metadata.json").write_text(json.dumps(metadata, indent=2))
     with args.output.open("w") as handle:
         for name in args.tasks.split(","):

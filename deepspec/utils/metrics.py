@@ -1,4 +1,5 @@
 import re
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -171,3 +172,15 @@ def reset() -> None:
 
 
 __all__ = ["add_metric", "flush", "reset"]
+
+
+@contextmanager
+def isolated_metrics():
+    """Discard validation-side emits while preserving pending training metrics."""
+    global _metrics
+    previous = _metrics
+    _metrics = {}
+    try:
+        yield
+    finally:
+        _metrics = previous

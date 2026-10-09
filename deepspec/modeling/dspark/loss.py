@@ -113,6 +113,8 @@ def _collect_local_terms(
     loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
     ce_loss_num = (loss_per_token * flat_weights).sum()
     ce_loss_den = flat_weights.sum()
+    add_metric("ce_unweighted", (loss_per_token * eval_mask.reshape(-1)).sum(),
+               den=eval_mask.sum(), tag=metric_tag)
     aligned_target_logits = outputs.aligned_target_logits
     accept_rate_3d = _compute_accept_rate_3d(
         outputs=outputs,
@@ -190,19 +192,20 @@ def _collect_local_terms(
         "confidence_loss_den": confidence_loss_den,
     }
 
-    for pos_idx in range(block_size):
+    if accept_rate_3d is not None:
+        for pos_idx in range(block_size):
+            add_metric(
+                f"accept_rate@{pos_idx}",
+                pos_accept_sums[pos_idx],
+                den=pos_total_counts[pos_idx],
+                tag=metric_tag,
+            )
         add_metric(
-            f"accept_rate@{pos_idx}",
-            pos_accept_sums[pos_idx],
-            den=pos_total_counts[pos_idx],
+            "tau_probabilistic",
+            tau_prob_sum,
+            den=accept_block_count,
             tag=metric_tag,
         )
-    add_metric(
-        "tau_probabilistic",
-        tau_prob_sum,
-        den=accept_block_count,
-        tag=metric_tag,
-    )
     if has_confidence:
         add_metric(
             "confidence_abs_error",

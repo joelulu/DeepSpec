@@ -16,9 +16,13 @@ def main():
     parser.add_argument("--target", required=True)
     parser.add_argument("--global-batch", type=int, default=16)
     parser.add_argument("--local-batch", type=int, default=1)
+    parser.add_argument("--data-percent", default="100")
+    parser.add_argument("--holdout-samples", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--check-cuda", action="store_true")
     args = parser.parse_args()
-    dataset = CacheDataset(cache_dir=args.cache)
+    dataset = CacheDataset(cache_dir=args.cache, data_percent=args.data_percent,
+        holdout_samples=args.holdout_samples, subset_seed=args.seed)
     manifest = dataset.manifest
     target = AutoConfig.from_pretrained(args.target)
     if target.model_type != "qwen3":
@@ -42,7 +46,8 @@ def main():
         if args.global_batch % (count * args.local_batch):
             raise ValueError("GLOBAL_BATCH must be divisible by visible GPUs * LOCAL_BATCH")
         print("GPUs:", [torch.cuda.get_device_name(index) for index in range(count)])
-    print(json.dumps(dict(target=args.target, samples=len(dataset), target_layer_ids=layer_ids,
+    print(json.dumps(dict(target=args.target, source_samples=dataset.source_num_samples, samples=len(dataset),
+        data_percent=args.data_percent, holdout_samples=args.holdout_samples, target_layer_ids=layer_ids,
         hidden_size=target.hidden_size, first_sample_tokens=sample["input_ids"].numel(),
         cache_version=manifest["version"]), indent=2))
 

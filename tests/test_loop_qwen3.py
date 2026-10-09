@@ -144,12 +144,14 @@ def test_multi_exit_training_backward_checkpoint_and_mask(monkeypatch, tmp_path,
 
 
 @pytest.mark.parametrize("loops", [1, 2, 3])
-def test_speculative_greedy_generation_matches_target_ar(loops):
+@pytest.mark.parametrize("boundary_norm", [False, True])
+def test_speculative_greedy_generation_matches_target_ar(loops, boundary_norm):
     target_cfg = copy.deepcopy(config(1))
     target_cfg.num_hidden_layers = 4
     target_cfg.layer_types = ["full_attention"] * 4
     target = Qwen3ForCausalLM(target_cfg).eval()
-    draft = Qwen3DSparkModel(config()).eval()
+    draft_cfg = config(); draft_cfg.loop_boundary_norm = boundary_norm
+    draft = Qwen3DSparkModel(draft_cfg).eval()
     draft.eval_num_loops = loops
     prompt = torch.tensor([[2, 7, 9, 3]])
     def init_context(initial_output, **kwargs):

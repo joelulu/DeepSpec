@@ -20,6 +20,8 @@ def main():
         payload = json.loads(path.read_text())
         for metric in payload["metrics"]:
             rows.append(dict(checkpoint=payload["args"]["draft_name_or_path"],
+                loop_boundary_norm=payload.get("loop_boundary_norm", False),
+                training_loop_loss_weights=json.dumps(payload.get("loop_loss_weights", [])),
                 target=payload["args"]["target_name_or_path"],
                 temperature=payload["args"]["temperature"],
                 max_new_tokens=payload["args"]["max_new_tokens"],
@@ -29,6 +31,8 @@ def main():
                 dataset=metric["dataset"], samples=metric["num_samples"],
                 accept_length=metric["acceptance_length"],
                 serial_decode_tps=metric.get("serial_decode_tokens_per_second", ""),
+                serial_generation_tps=metric.get("serial_generation_tokens_per_second", ""),
+                generation_wall_ms=metric.get("generation_wall_ms", ""),
                 round_wall_ms=metric.get("round_wall_ms", ""),
                 draft_ms=metric.get("draft_ms", ""), verify_ms=metric.get("verify_ms", ""),
                 conditional_accept_rates=json.dumps(metric["conditional_accept_rates_by_position"])))
@@ -38,7 +42,11 @@ def main():
         return tuple(row[key] for key in ("target", "temperature", "max_new_tokens", "seed", "dataset", "samples"))
     ar_rates = {comparison_key(row): float(row["serial_decode_tps"]) for row in rows
                 if row["num_layers"] == 0 and row["serial_decode_tps"]}
+    ar_generation_rates = {comparison_key(row): float(row["serial_generation_tps"]) for row in rows
+                           if row["num_layers"] == 0 and row["serial_generation_tps"]}
     for row in rows:
+        generation_baseline = ar_generation_rates.get(comparison_key(row))
+        row["generation_speedup_vs_ar"] = float(row["serial_generation_tps"]) / generation_baseline if generation_baseline and row["serial_generation_tps"] else ""
         baseline = ar_rates.get(comparison_key(row))
         row["speedup_vs_ar"] = float(row["serial_decode_tps"]) / baseline if baseline and row["serial_decode_tps"] else ""
     args.output.parent.mkdir(parents=True, exist_ok=True)

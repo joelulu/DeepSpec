@@ -76,6 +76,12 @@ def load_resume_draft_model(
         dtype=precision_dtype,
         attn_implementation=str(draft_model.config._attn_implementation),
     )
+    for key, default in (("num_hidden_layers", None), ("num_loops", 1),
+                         ("loop_boundary_norm", False), ("loop_loss_weights", None)):
+        expected = getattr(draft_model.config, key, default)
+        actual = getattr(resumed_model.config, key, default)
+        if expected != actual:
+            raise ValueError(f"Resume model mismatch for {key}: checkpoint={actual}, requested={expected}")
     resumed_model = resumed_model.to(device=device, dtype=precision_dtype)
     resumed_model.set_embedding_head_trainable(False)
     return resumed_model

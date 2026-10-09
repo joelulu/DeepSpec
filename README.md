@@ -1,3 +1,12 @@
+## Flexible looped DFlash experiments
+
+Train with `bash train_dflash_loop.sh LAYERS LOOPS`; edit data percentage and
+budget in `scripts/loop/settings.sh`. Run `bash run_dflash_experiments.sh` for
+the five sequential eight-GPU, three-epoch comparisons, then
+`bash eval_temp.sh`. Start with `bash smoke_dflash_flex.sh` to check the actual
+GPU environment. See [configuration, metrics and audit](scripts/loop/FLEX_EXPERIMENTS.md).
+The older 3% pilot scripts below remain available but use their original settings.
+
 # DeepSpec
 
 DeepSpec is a full-stack codebase for training and evaluating draft models for speculative decoding. It contains data preparation utilities, draft model implementations, training code, and evaluation scripts.
