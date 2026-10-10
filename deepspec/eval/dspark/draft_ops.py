@@ -6,6 +6,7 @@ import torch
 from transformers import DynamicCache
 
 from deepspec.eval.base_evaluator import DraftProposal
+from deepspec.eval.dspark.loopcd import LoopCDConfig, loopcd_logits
 from deepspec.utils.sampling import logits_to_probs
 from deepspec.modeling.dspark.gemma4 import Gemma4DSparkModel
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
@@ -29,13 +30,18 @@ def forward_dspark_draft_block(
     target_hidden_states: torch.Tensor,
     start: int,
     block_size: int,
-) -> torch.Tensor:
+    return_all_loop_hidden: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     draft_position_ids = position_ids[
         :, past_key_values_draft.get_seq_length() : start + block_size
     ]
     backbone_kwargs = {}
     if isinstance(model, Qwen3DSparkModel):
         backbone_kwargs["num_loops"] = getattr(model, "eval_num_loops", model.num_loops)
+        if return_all_loop_hidden:
+            backbone_kwargs["return_all_loop_hidden"] = True
+    elif return_all_loop_hidden:
+        raise ValueError("LoopCD exit collection currently supports Qwen3 only")
     block_hidden = model._forward_backbone(
         target_hidden_states=target_hidden_states,
         noise_embedding=model.embed_tokens(draft_input_ids),
@@ -109,10 +115,20 @@ def build_dspark_proposal(
     block_size: int,
     temperature: float,
     confidence_threshold: float,
+    loopcd: LoopCDConfig | None = None,
+    early_block_hidden: torch.Tensor | None = None,
 ) -> DSparkDraftProposal:
     assert draft_input_ids.size(0) == 1, "build_dspark_proposal requires batch_size=1"
+    if (loopcd is None) != (early_block_hidden is None):
+        raise ValueError("LoopCD config and early hidden states must be supplied together")
     proposal_hidden_states = block_hidden[:, :block_size, :]
     base_draft_logits = model.compute_logits(proposal_hidden_states)
+    if loopcd is not None:
+        if not isinstance(model, Qwen3DSparkModel):
+            raise ValueError("LoopCD currently supports Qwen3 only")
+        loopcd.validate_model(model, getattr(model, "eval_num_loops", model.num_loops))
+        early_logits = model.compute_logits(early_block_hidden[:, :block_size, :])
+        base_draft_logits = loopcd_logits(base_draft_logits, early_logits, loopcd)
     sampled_tokens, draft_logits = model.sample_draft_tokens(
         base_draft_logits,
         first_prev_token_ids=draft_input_ids[:, 0],

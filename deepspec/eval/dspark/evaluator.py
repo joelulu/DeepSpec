@@ -14,6 +14,7 @@ from deepspec.eval.base_evaluator import (
     generate_decoding_sample,
 )
 from deepspec.eval.dspark.confidence_head import ConfidenceHeadRecorder
+from deepspec.eval.dspark.loopcd import LoopCDConfig
 from deepspec.eval.dspark.draft_ops import (
     DSparkDraftProposal,
     build_dspark_proposal,
@@ -86,6 +87,18 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             if not isinstance(draft_model, Qwen3DSparkModel):
                 raise ValueError("Loop evaluation currently supports Qwen3 only")
             draft_model.eval_num_loops = int(requested_loops)
+        self.loopcd = None
+        if getattr(self.args, "loopcd", False):
+            if not isinstance(draft_model, Qwen3DSparkModel):
+                raise ValueError("LoopCD currently supports Qwen3 only")
+            self.loopcd = LoopCDConfig(
+                early_loop=self.args.loopcd_early_loop,
+                strength=self.args.loopcd_lambda,
+                alpha=self.args.loopcd_alpha,
+            )
+            self.loopcd.validate_model(
+                draft_model, getattr(draft_model, "eval_num_loops", draft_model.num_loops)
+            )
         assert_no_final_target_layer(target_model, draft_model.target_layer_ids)
         assert 0.0 <= float(self.args.confidence_threshold) <= 1.0
         tokenizer = AutoTokenizer.from_pretrained(self.args.target_name_or_path)
@@ -124,6 +137,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             device=output_ids.device,
         )
         draft_input_ids[:, 0] = output_ids[:, start]
+        loopcd = getattr(self, "loopcd", None)
         block_hidden = forward_dspark_draft_block(
             model,
             draft_input_ids=draft_input_ids,
@@ -132,7 +146,12 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             target_hidden_states=context.target_hidden_states,
             start=start,
             block_size=self.max_proposal_tokens,
+            return_all_loop_hidden=loopcd is not None,
         )
+        early_block_hidden = None
+        if loopcd is not None:
+            early_block_hidden = block_hidden[loopcd.early_loop - 1]
+            block_hidden = block_hidden[-1]
         return build_dspark_proposal(
             model=model,
             draft_input_ids=draft_input_ids,
@@ -140,6 +159,8 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             block_size=self.max_proposal_tokens,
             temperature=float(self.args.temperature),
             confidence_threshold=float(self.args.confidence_threshold),
+            loopcd=loopcd,
+            early_block_hidden=early_block_hidden,
         )
 
     def _update(

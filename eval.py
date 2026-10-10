@@ -9,6 +9,7 @@ from deepspec.eval.dspark import Gemma4DSparkEvaluator, Qwen3DSparkEvaluator
 from deepspec.eval.eagle3 import Gemma4Eagle3Evaluator, Qwen3Eagle3Evaluator
 from deepspec.utils import CustomJSONEncoder
 from deepspec.eval.ar_evaluator import AREvaluator
+from deepspec.eval.dspark.loopcd import LoopCDConfig
 
 EVALUATORS = {
     "Qwen3DSparkModel": Qwen3DSparkEvaluator,
@@ -49,10 +50,23 @@ def parse_args():
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task names")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--num-loops", type=int, default=None)
+    parser.add_argument("--loopcd", action="store_true", help="Contrast final and early loop logits (frozen Qwen3 DFlash only)")
+    parser.add_argument("--loopcd-early-loop", type=int, default=1, help="One-based early exit index")
+    parser.add_argument("--loopcd-lambda", type=float, default=0.2)
+    parser.add_argument("--loopcd-alpha", type=float, default=0.1, help="Final-loop relative plausibility threshold")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--warmup-samples", type=int, default=1)
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
+    if args.loopcd:
+        if args.autoregressive:
+            parser.error("--loopcd requires a looped Qwen3 DFlash checkpoint")
+        try:
+            loopcd = LoopCDConfig(args.loopcd_early_loop, args.loopcd_lambda, args.loopcd_alpha)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.num_loops is not None and loopcd.early_loop >= args.num_loops:
+            parser.error("--loopcd-early-loop must be less than --num-loops")
     if not args.autoregressive and args.draft_name_or_path is None:
         parser.error("--draft_name_or_path is required unless --autoregressive is set")
     if args.autoregressive:
@@ -82,6 +96,8 @@ def main(local_rank: int, args):
     else:
         draft_config = AutoConfig.from_pretrained(args.draft_name_or_path)
         evaluator_cls = EVALUATORS[draft_config.architectures[0]]
+        if args.loopcd and evaluator_cls is not Qwen3DSparkEvaluator:
+            raise ValueError("--loopcd currently supports Qwen3 DFlash only")
     evaluator = evaluator_cls(local_rank, args)
     evaluator.evaluate()
     if args.output_json and dist.get_rank() == 0:

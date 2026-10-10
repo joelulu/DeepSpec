@@ -155,3 +155,6 @@ Training prints git provenance; it does not run `git commit` or `git push`.
 
 References: [Ouro paper](https://arxiv.org/abs/2510.25741),
 [official inference model](https://huggingface.co/ByteDance/Ouro-1.4B/blob/main/modeling_ouro.py).
+
+For an inference-only comparison on a frozen looped checkpoint, see
+[LoopCD evaluation](../../docs/loopcd.md) and `eval_dflash_loopcd.sh`.
