@@ -91,7 +91,9 @@ def load_resume_draft_model(
         attn_implementation=str(draft_model.config._attn_implementation),
     )
     for key, default in (("num_hidden_layers", None), ("num_loops", 1),
-                         ("loop_boundary_norm", False), ("loop_loss_weights", None)):
+                         ("loop_boundary_norm", False), ("loop_loss_weights", None),
+                         ("enable_exit_gate", False), ("ouro_training_mode", "baseline"),
+                         ("min_exit_loop", 3)):
         expected = getattr(draft_model.config, key, default)
         actual = getattr(resumed_model.config, key, default)
         if expected != actual:

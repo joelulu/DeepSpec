@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task names")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--num-loops", type=int, default=None)
+    parser.add_argument("--exit-gate", action="store_true", help="Enable block-level Q-exit")
+    parser.add_argument("--exit-q", type=float, default=0.8)
     parser.add_argument("--loopcd", action="store_true", help="Contrast final and early loop logits (frozen Qwen3 DFlash only)")
     parser.add_argument("--loopcd-early-loop", type=int, default=1, help="One-based early exit index")
     parser.add_argument("--loopcd-lambda", type=float, default=0.2)
@@ -58,6 +60,10 @@ def parse_args():
     parser.add_argument("--warmup-samples", type=int, default=1)
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
+    if args.exit_gate and (args.autoregressive or args.loopcd):
+        parser.error("--exit-gate requires DFlash and cannot currently be combined with LoopCD")
+    if not 0 < args.exit_q <= 1:
+        parser.error("--exit-q must be in (0, 1]")
     if args.loopcd:
         if args.autoregressive:
             parser.error("--loopcd requires a looped Qwen3 DFlash checkpoint")

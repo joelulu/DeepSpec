@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import torch.distributed as dist
 from types import SimpleNamespace
 
 import torch
@@ -38,6 +40,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
     def __init__(self, local_rank: int, args):
         super().__init__(local_rank, args)
         self.confidence_head_recorder = self._build_confidence_head_recorder()
+        self.exit_depth_hist = torch.zeros(int(getattr(self.draft_model, "num_loops", 1)), device=self.device, dtype=torch.long)
 
     @property
     def max_proposal_tokens(self) -> int:
@@ -88,6 +91,12 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
                 raise ValueError("Loop evaluation currently supports Qwen3 only")
             draft_model.eval_num_loops = int(requested_loops)
         self.loopcd = None
+        if getattr(self.args, "exit_gate", False):
+            if not isinstance(draft_model, Qwen3DSparkModel) or draft_model.exit_gate is None or not getattr(draft_model.config, "exit_gate_trained", False):
+                raise ValueError("--exit-gate requires a checkpoint with a trained exit gate")
+            if int(getattr(draft_model, "eval_num_loops", draft_model.num_loops)) < int(draft_model.config.min_exit_loop):
+                raise ValueError("--num-loops is below the gate's minimum exit depth")
+            draft_model.eval_exit_q = float(self.args.exit_q)
         if getattr(self.args, "loopcd", False):
             if not isinstance(draft_model, Qwen3DSparkModel):
                 raise ValueError("LoopCD currently supports Qwen3 only")
@@ -149,6 +158,9 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             return_all_loop_hidden=loopcd is not None,
         )
         early_block_hidden = None
+        if not getattr(self, "_warming_up", False) and hasattr(self, "exit_depth_hist"):
+            depth = getattr(model, "last_exit_depth", None) or 1
+            self.exit_depth_hist[depth - 1] += 1
         if loopcd is not None:
             early_block_hidden = block_hidden[loopcd.early_loop - 1]
             block_hidden = block_hidden[-1]
@@ -213,6 +225,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
 
     def evaluate(self) -> None:
         for dataset_name, max_samples in self.tasks:
+            self.exit_depth_hist.zero_()
             if self.confidence_head_recorder is not None:
                 self.confidence_head_recorder.start()
             responses = self.run_dataset(
@@ -240,6 +253,21 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
                     args_payload=jsonable(vars(self.args)),
                     tasks=self.tasks,
                 )
+            counts = self.exit_depth_hist.clone()
+            dist.all_reduce(counts)
+            if metrics_row is not None:
+                total = counts.sum().item()
+                metrics_row["exit_depth_counts"] = counts.cpu().tolist()
+                metrics_row["mean_executed_loops"] = (counts * torch.arange(1, counts.numel() + 1, device=counts.device)).sum().item() / total if total else 0.0
+                metrics_row["exit_gate_enabled"] = bool(getattr(self.args, "exit_gate", False))
+            if getattr(self.args, "output_json", None):
+                destination = Path(self.args.output_json).with_suffix(f".{dataset_name}.rank{self.global_rank}.responses.jsonl")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with destination.open("w", encoding="utf-8") as handle:
+                    for response in responses:
+                        ids = response.output_ids[0].cpu().tolist()
+                        handle.write(json.dumps(dict(token_ids=ids, text=self.tokenizer.decode(ids),
+                            num_output_tokens=response.num_output_tokens), ensure_ascii=False) + "\n")
 
         self.report_results()
 

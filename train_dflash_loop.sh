@@ -3,6 +3,12 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$repo_root"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+case "${1:-}" in
+  baseline|A|B|B-gate)
+    source scripts/loop/settings.sh
+    exec "${PYTHON:-python}" scripts/loop/launch_ouro.py "$@"
+    ;;
+esac
 if [[ $# == 1 ]]; then
   case "$1" in
     5l) set -- 5 1 ;; 15l) set -- 15 1 ;; loop5x3) set -- 5 3 ;;

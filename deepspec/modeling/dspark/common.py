@@ -38,6 +38,8 @@ class DSparkForwardOutput:
     confidence_pred: Optional[torch.Tensor] = None
     # [batch_size, num_anchors, block_size, vocab_size]
     aligned_target_logits: Optional[torch.Tensor] = None
+    # [batch_size, num_anchors], conditional stopping logit for this loop.
+    exit_gate_logits: Optional[torch.Tensor] = None
 
 
 class AcceptRatePredictor(nn.Module):

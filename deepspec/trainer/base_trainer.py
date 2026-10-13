@@ -181,6 +181,7 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
+        self.prepare_model_for_training()
         self.trainable_parameter_count = sum(p.numel() for p in self.draft_model.parameters() if p.requires_grad)
         self.model = self.draft_model
         if self.args.train.torch_compile:
@@ -260,6 +261,7 @@ class BaseTrainer:
         print_on_local_main(f"  Source samples = {self.train_dataset.source_num_samples}; data percent = {self.args.data.get('data_percent', 100)}; holdout = {len(self.validation_dataset) if self.validation_dataset is not None else 0}")
         print_on_local_main(f"  Draft layers = {len(self.draft_model.layers)}; loops = {getattr(self.draft_model, 'num_loops', 1)}; boundary norm = {getattr(self.draft_model, 'loop_boundary_norm', False)}; loss weights = {self.args.model.get('loop_loss_weights', [1.0])}")
         print_on_local_main(f"  Trainable parameters = {self.trainable_parameter_count:,}")
+        print_on_local_main(f"  Ouro training mode = {self.args.model.get('ouro_training_mode', 'baseline')}; initialization checkpoint = {self.args.model.get('init_checkpoint')}")
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
         print_on_local_main(f"  Local batch size = {self.args.train.local_batch_size}")
@@ -282,6 +284,30 @@ class BaseTrainer:
             target_config=target_config,
             model_args=model_args,
         )
+        init_checkpoint = model_args.get("init_checkpoint")
+        if init_checkpoint:
+            source_config = AutoConfig.from_pretrained(init_checkpoint)
+            source_has_gate = bool(getattr(source_config, "enable_exit_gate", False))
+            for key in ("num_hidden_layers", "num_loops", "block_size", "hidden_size",
+                        "target_layer_ids", "mask_token_id", "loop_boundary_norm",
+                        "markov_rank", "enable_confidence_head"):
+                default = False if key == "loop_boundary_norm" else None
+                if getattr(source_config, key, default) != getattr(draft_model.config, key, default):
+                    raise ValueError(f"Initialization checkpoint mismatch for {key}")
+            for key in ("enable_exit_gate", "ouro_training_mode", "min_exit_loop", "ouro_beta",
+                        "gate_gain_slope", "gate_gain_threshold"):
+                setattr(source_config, key, getattr(draft_model.config, key))
+            source_config.loop_loss_weights = draft_model.config.loop_loss_weights
+            draft_model, info = type(draft_model).from_pretrained(
+                init_checkpoint, config=source_config, dtype=self.precision_dtype,
+                attn_implementation=str(draft_model.config._attn_implementation),
+                output_loading_info=True,
+            )
+            allowed_missing = {"exit_gate.weight", "exit_gate.bias"} if not source_has_gate and draft_model.exit_gate is not None else set()
+            if set(info["missing_keys"]) - allowed_missing or info["unexpected_keys"] or info.get("mismatched_keys"):
+                raise ValueError(f"Checkpoint loading mismatch: {info}")
+            draft_model.set_embedding_head_trainable(False)
+            return draft_model.to(device=self.device, dtype=self.precision_dtype), tokenizer
         draft_model = draft_model.to(device=self.device, dtype=self.precision_dtype)
 
         # Training only uses the target checkpoint to initialize frozen draft
@@ -300,6 +326,10 @@ class BaseTrainer:
         )
         del target_model
         return draft_model, tokenizer
+
+    def prepare_model_for_training(self):
+        """Apply stage-specific freezing after initialization or resume, before FSDP."""
+        pass
 
     def _build_draft_model(self, *, target_config, model_args):
         raise NotImplementedError

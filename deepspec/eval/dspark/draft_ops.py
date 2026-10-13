@@ -40,6 +40,8 @@ def forward_dspark_draft_block(
         backbone_kwargs["num_loops"] = getattr(model, "eval_num_loops", model.num_loops)
         if return_all_loop_hidden:
             backbone_kwargs["return_all_loop_hidden"] = True
+        if getattr(model, "eval_exit_q", None) is not None:
+            backbone_kwargs["exit_q"] = model.eval_exit_q
     elif return_all_loop_hidden:
         raise ValueError("LoopCD exit collection currently supports Qwen3 only")
     block_hidden = model._forward_backbone(

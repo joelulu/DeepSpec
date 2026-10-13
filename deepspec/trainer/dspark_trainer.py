@@ -9,6 +9,7 @@ from deepspec.modeling.dspark.gemma4.config import (
     build_draft_config as build_gemma4_draft_config,
 )
 from deepspec.modeling.dspark.loss import compute_dspark_loss
+from deepspec.modeling.dspark.ouro import compute_ouro_loss
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from deepspec.modeling.dspark.qwen3.config import (
     build_draft_config as build_qwen3_draft_config,
@@ -18,6 +19,26 @@ from deepspec.trainer.base_trainer import BaseTrainer
 
 class Qwen3DSparkTrainer(BaseTrainer):
     data_collator_cls = CacheCollator
+
+    def prepare_model_for_training(self):
+        mode = self.args.model.get("ouro_training_mode", "baseline")
+        if mode != "baseline":
+            if self.args.model.get("sample_loop_count", False):
+                raise ValueError("Ouro training requires full loop depth")
+            if self.draft_model.markov_head is not None or self.draft_model.confidence_head is not None:
+                raise ValueError("The initial Ouro implementation is CE-only DFlash")
+            if float(self.args.model.get("l1_loss_alpha", 0)) != 0:
+                raise ValueError("Ouro training currently uses CE only")
+        if mode == "gate_only":
+            if not self.args.model.get("init_checkpoint"):
+                raise ValueError("gate_only requires init_checkpoint")
+            self.draft_model.requires_grad_(False)
+            self.draft_model.exit_gate.requires_grad_(True)
+
+    def save_and_eval_checkpoint(self):
+        if getattr(self.draft_model, "exit_gate", None) is not None and self.global_step > 0:
+            self.draft_model.config.exit_gate_trained = True
+        return super().save_and_eval_checkpoint()
 
     def _build_draft_model(self, *, target_config, model_args):
         draft_config = build_qwen3_draft_config(
@@ -50,6 +71,11 @@ class Qwen3DSparkTrainer(BaseTrainer):
         )
         is_multi_exit = isinstance(outputs, tuple)
         exit_outputs = outputs if is_multi_exit else (outputs,)
+        if self.args.model.get("ouro_training_mode", "baseline") != "baseline":
+            loss = compute_ouro_loss(exit_outputs, self.draft_model.config)
+            add_metric("objective", loss, reduction="dp_mean", tag="train")
+            add_metric("num_loops", loops, reduction="last", tag="train")
+            return loss
         weights = self.args.model.get("loop_loss_weights", [1.0] * len(exit_outputs))
         active_weights = [float(w) for w in weights[:len(exit_outputs)]]
         if len(active_weights) != len(exit_outputs) or min(active_weights) < 0 or sum(active_weights) <= 0:

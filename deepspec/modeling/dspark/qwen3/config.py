@@ -54,6 +54,15 @@ def build_draft_config(
     if model_args.get("sample_loop_count", False) and draft_config.loop_loss_weights[0] <= 0:
         raise ValueError("sample_loop_count requires a positive first loop loss weight")
     draft_config.loop_boundary_norm = bool(model_args.get("loop_boundary_norm", False))
+    draft_config.enable_exit_gate = bool(model_args.get("enable_exit_gate", False))
+    draft_config.ouro_training_mode = str(model_args.get("ouro_training_mode", "baseline"))
+    draft_config.min_exit_loop = int(model_args.get("min_exit_loop", 3))
+    draft_config.ouro_beta = float(model_args.get("ouro_beta", 0.1))
+    draft_config.gate_gain_slope = float(model_args.get("gate_gain_slope", 50.0))
+    draft_config.gate_gain_threshold = float(model_args.get("gate_gain_threshold", 0.005))
+    draft_config.exit_gate_trained = False
+    from deepspec.modeling.dspark.ouro import validate_exit_config
+    validate_exit_config(draft_config)
     draft_config.block_size = int(model_args.block_size)
     draft_config.tie_word_embeddings = False
     draft_config.layer_types = layer_types

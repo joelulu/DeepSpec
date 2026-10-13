@@ -1,4 +1,5 @@
 from typing import Callable, Optional
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -29,6 +30,7 @@ from deepspec.modeling.dspark.common import (
 )
 from deepspec.modeling.dspark.markov_head import build_markov_head
 from deepspec.modeling.dspark.context_cache import ContextKVCache
+from deepspec.modeling.dspark.ouro import validate_exit_config
 from deepspec.utils.sampling import sample_tokens
 
 
@@ -282,6 +284,10 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             raise ValueError("num_loops must be >= 1")
 
         self.loop_boundary_norm = bool(getattr(config, "loop_boundary_norm", False))
+        validate_exit_config(config)
+        self.exit_gate = nn.Linear(config.hidden_size, 1) if getattr(config, "enable_exit_gate", False) else None
+        self.eval_exit_q = None
+        self.last_exit_depth = None
 
         # Markov head.
         self.markov_head = build_markov_head(config)
@@ -404,6 +410,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         use_cache: bool = False,
         num_loops: Optional[int] = None,
         return_all_loop_hidden: bool = False,
+        exit_q: Optional[float] = None,
+        min_exit_loop: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         diagnostics = kwargs.pop("diagnostics", False)
@@ -414,6 +422,20 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         loops = self.num_loops if num_loops is None else int(num_loops)
         if not 1 <= loops <= self.num_loops:
             raise ValueError(f"num_loops must be in [1, {self.num_loops}]")
+        if exit_q is not None:
+            if self.training or return_all_loop_hidden:
+                raise ValueError("Dynamic exit is inference-only and cannot collect all exits")
+            if self.exit_gate is None or not getattr(self.config, "exit_gate_trained", False):
+                raise ValueError("Dynamic exit requires a trained exit gate")
+            if hidden_states.shape[0] != 1 or hidden_states.shape[1] != self.block_size:
+                raise ValueError("Dynamic exit currently requires one request and one draft block")
+            minimum = int(min_exit_loop if min_exit_loop is not None else self.config.min_exit_loop)
+            if minimum != int(self.config.min_exit_loop):
+                raise ValueError("min_exit_loop must match the gate training configuration")
+            if not 0 < float(exit_q) <= 1 or not minimum <= loops:
+                raise ValueError("Invalid exit_q or maximum loop count")
+            remaining = hidden_states.new_ones((), dtype=torch.float32)
+            cdf = hidden_states.new_zeros((), dtype=torch.float32)
         context_cache = past_key_values if isinstance(past_key_values, ContextKVCache) else None
         if loops > 1 and past_key_values is not None and context_cache is None:
             raise ValueError("Repeated depth requires ContextKVCache, not a mixed block/context cache")
@@ -444,7 +466,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                     position_embeddings=position_embeddings,
                     **layer_kwargs,
                 )
-            exit_hidden = self.norm(hidden_states) if return_all_loop_hidden or self.loop_boundary_norm or loop_index == loops - 1 else None
+            exit_hidden = self.norm(hidden_states) if return_all_loop_hidden or self.loop_boundary_norm or exit_q is not None or loop_index == loops - 1 else None
             if diagnostics:
                 from deepspec.utils.metrics import add_metric
                 with torch.no_grad():
@@ -459,6 +481,13 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 exits.append(exit_hidden)
             if self.loop_boundary_norm:
                 hidden_states = exit_hidden
+            self.last_exit_depth = loop_index + 1
+            if exit_q is not None and minimum <= loop_index + 1 < loops:
+                g = self.exit_gate(exit_hidden.mean(dim=1)).float().sigmoid().squeeze()
+                cdf = cdf + remaining * g
+                remaining = remaining * (1 - g)
+                if cdf.item() >= float(exit_q):
+                    break
         return tuple(exits) if return_all_loop_hidden else exit_hidden
 
     def forward(
@@ -497,16 +526,18 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             block_size=self.block_size,
             device=device,
         )
-        output_hiddens = self._forward_backbone(
-            position_ids=full_position_ids,
-            noise_embedding=noise_embedding,
-            target_hidden_states=target_hidden_states,
-            attention_mask=dspark_attn_mask,
-            num_loops=num_loops,
-            return_all_loop_hidden=True,
-            diagnostics=diagnostics,
-            diagnostic_mask=block_keep_mask.repeat_interleave(self.block_size, dim=1),
-        )
+        gate_only = getattr(self.config, "ouro_training_mode", "baseline") == "gate_only"
+        with torch.no_grad() if gate_only else nullcontext():
+            output_hiddens = self._forward_backbone(
+                position_ids=full_position_ids,
+                noise_embedding=noise_embedding,
+                target_hidden_states=target_hidden_states,
+                attention_mask=dspark_attn_mask,
+                num_loops=num_loops,
+                return_all_loop_hidden=True,
+                diagnostics=diagnostics,
+                diagnostic_mask=block_keep_mask.repeat_interleave(self.block_size, dim=1),
+            )
 
         num_blocks = anchor_positions.size(1)
 
@@ -572,9 +603,12 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         for exit_index, output_hidden in enumerate(output_hiddens):
             weights = getattr(self.config, "loop_loss_weights", [1.0] * self.num_loops)
             # Monitoring an unsupervised exit must not retain a vocabulary-sized graph.
-            if self.training and float(weights[exit_index]) == 0:
+            if self.training and getattr(self.config, "ouro_training_mode", "baseline") == "baseline" and float(weights[exit_index]) == 0:
                 output_hidden = output_hidden.detach()
             output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
+            exit_gate_logits = None
+            if self.exit_gate is not None:
+                exit_gate_logits = self.exit_gate(output_hidden_4d.mean(dim=-2)).squeeze(-1)
             draft_logits = self.compute_logits(output_hidden).reshape(
                 bsz, num_blocks, self.block_size, -1
             )
@@ -598,6 +632,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 block_keep_mask=block_keep_mask,
                 confidence_pred=confidence_pred,
                 aligned_target_logits=aligned_target_logits,
+                exit_gate_logits=exit_gate_logits,
             ))
         return tuple(outputs) if self.num_loops > 1 else outputs[0]
 

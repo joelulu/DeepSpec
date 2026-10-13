@@ -1,5 +1,7 @@
 ## Flexible looped DFlash experiments
 
+Block-level Ouro exit training and inference: see [baseline / A / B commands](docs/ouro_gate_training.md).
+
 Train with `bash train_dflash_loop.sh LAYERS LOOPS`; edit data percentage and
 budget in `scripts/loop/settings.sh`. Run `bash run_dflash_experiments.sh` for
 the five sequential eight-GPU, three-epoch comparisons, then

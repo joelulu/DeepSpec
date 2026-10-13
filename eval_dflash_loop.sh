@@ -3,6 +3,14 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$repo_root"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+if [[ $# == 2 ]]; then
+  case "$1" in
+    fixed|gate|both)
+      source scripts/loop/settings.sh
+      exec "${PYTHON:-python}" scripts/loop/eval_ouro.py "$@"
+      ;;
+  esac
+fi
 if [[ $# -ne 1 ]]; then
   echo "Usage: bash eval_dflash_loop.sh fixed|prefix" >&2; exit 2
 fi
