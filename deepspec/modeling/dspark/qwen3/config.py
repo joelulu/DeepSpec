@@ -78,6 +78,10 @@ def build_draft_config(
     draft_config.markov_rank = markov_rank
     if markov_rank > 0:
         draft_config.markov_head_type = str(model_args.markov_head_type)
+    from deepspec.modeling.dspark.side_loop import SIDE_CONFIG_DEFAULTS, validate_side_config
+    for key, default in SIDE_CONFIG_DEFAULTS.items():
+        setattr(draft_config, key, model_args.get(key, default))
+    validate_side_config(draft_config)
     return draft_config
 
 

@@ -292,18 +292,32 @@ class BaseTrainer:
                         "target_layer_ids", "mask_token_id", "loop_boundary_norm",
                         "markov_rank", "enable_confidence_head"):
                 default = False if key == "loop_boundary_norm" else None
+                if key == "block_size" and model_args.get("allow_block_size_transfer", False):
+                    source_config.block_size = draft_model.config.block_size
+                    continue
                 if getattr(source_config, key, default) != getattr(draft_model.config, key, default):
                     raise ValueError(f"Initialization checkpoint mismatch for {key}")
             for key in ("enable_exit_gate", "ouro_training_mode", "min_exit_loop", "ouro_beta",
                         "gate_gain_slope", "gate_gain_threshold"):
                 setattr(source_config, key, getattr(draft_model.config, key))
             source_config.loop_loss_weights = draft_model.config.loop_loss_weights
+            from deepspec.modeling.dspark.side_loop import SIDE_CONFIG_DEFAULTS
+            source_side = getattr(source_config, "side_loop_mode", "none")
+            requested_side = getattr(draft_model.config, "side_loop_mode", "none")
+            if source_side != "none":
+                for key, default in SIDE_CONFIG_DEFAULTS.items():
+                    if getattr(source_config, key, default) != getattr(draft_model.config, key, default):
+                        raise ValueError(f"Initialization checkpoint mismatch for {key}")
+            for key, default in SIDE_CONFIG_DEFAULTS.items():
+                setattr(source_config, key, getattr(draft_model.config, key, default))
             draft_model, info = type(draft_model).from_pretrained(
                 init_checkpoint, config=source_config, dtype=self.precision_dtype,
                 attn_implementation=str(draft_model.config._attn_implementation),
                 output_loading_info=True,
             )
             allowed_missing = {"exit_gate.weight", "exit_gate.bias"} if not source_has_gate and draft_model.exit_gate is not None else set()
+            if source_side == "none" and requested_side != "none":
+                allowed_missing |= {"side_fusion.down.weight", "side_fusion.up.weight"}
             if set(info["missing_keys"]) - allowed_missing or info["unexpected_keys"] or info.get("mismatched_keys"):
                 raise ValueError(f"Checkpoint loading mismatch: {info}")
             draft_model.set_embedding_head_trainable(False)

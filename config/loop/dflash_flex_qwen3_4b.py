@@ -17,6 +17,13 @@ model = dict(
     loop_loss_mode="final",
     loop_boundary_norm=False,
     sample_loop_count=False,
+    # Optional layer-1 side recurrence; legacy experiments keep it disabled.
+    side_loop_mode="none",
+    side_loop_steps=5,
+    side_group_size=3,
+    side_fusion_rank=128,
+    side_aux_loss_alpha=0.2,
+    allow_block_size_transfer=False,
     # Ouro adaptation; disabled by default to preserve legacy experiments.
     enable_exit_gate=False,
     ouro_training_mode="baseline",

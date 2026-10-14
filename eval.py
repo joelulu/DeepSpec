@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task names")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--num-loops", type=int, default=None)
+    parser.add_argument("--side-execution", choices=("serial", "overlap"), default="serial",
+                        help="CUDA overlap of layer-1 recurrence and layers 2..5")
     parser.add_argument("--exit-gate", action="store_true", help="Enable block-level Q-exit")
     parser.add_argument("--exit-q", type=float, default=0.8)
     parser.add_argument("--loopcd", action="store_true", help="Contrast final and early loop logits (frozen Qwen3 DFlash only)")
@@ -115,6 +117,10 @@ def main(local_rank: int, args):
             num_loops=0 if args.autoregressive else getattr(evaluator.draft_model, "eval_num_loops", getattr(evaluator.draft_model, "num_loops", 1)),
             loop_boundary_norm=False if args.autoregressive else getattr(evaluator.draft_model.config, "loop_boundary_norm", False),
             loop_loss_weights=[] if args.autoregressive else getattr(evaluator.draft_model.config, "loop_loss_weights", [1.0]),
+            side_loop_mode="none" if args.autoregressive else getattr(evaluator.draft_model, "side_loop_mode", "none"),
+            side_loop_steps=0 if args.autoregressive else getattr(evaluator.draft_model, "side_loop_steps", 0),
+            side_execution=args.side_execution,
+            block_size=0 if args.autoregressive else evaluator.draft_model.block_size,
             device_name=torch.cuda.get_device_name(evaluator.device),
             metrics=evaluator.metrics_rows,
             timing_scope="serial requests per GPU; not a serving-throughput benchmark",

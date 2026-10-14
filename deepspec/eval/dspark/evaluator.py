@@ -82,6 +82,13 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             dtype=torch.bfloat16,
             attn_implementation=self.EVAL_ATTN_IMPLEMENTATION,
         ).to(self.device).eval()
+        side_execution = getattr(self.args, "side_execution", "serial")
+        if getattr(draft_model, "side_loop_mode", "none") != "none":
+            if getattr(self.args, "loopcd", False) or getattr(self.args, "exit_gate", False):
+                raise ValueError("Side recurrence cannot combine with LoopCD/Ouro evaluation")
+            draft_model.side_execution = side_execution
+        elif side_execution != "serial":
+            raise ValueError("--side-execution overlap requires a side-loop checkpoint")
         requested_loops = getattr(self.args, "num_loops", None)
         if requested_loops is not None:
             maximum = int(getattr(draft_model, "num_loops", 1))

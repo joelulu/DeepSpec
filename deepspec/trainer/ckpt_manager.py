@@ -93,7 +93,9 @@ def load_resume_draft_model(
     for key, default in (("num_hidden_layers", None), ("num_loops", 1),
                          ("loop_boundary_norm", False), ("loop_loss_weights", None),
                          ("enable_exit_gate", False), ("ouro_training_mode", "baseline"),
-                         ("min_exit_loop", 3)):
+                         ("min_exit_loop", 3), ("side_loop_mode", "none"),
+                         ("side_loop_steps", 5), ("side_group_size", 3),
+                         ("side_fusion_rank", 128), ("side_aux_loss_alpha", 0.2)):
         expected = getattr(draft_model.config, key, default)
         actual = getattr(resumed_model.config, key, default)
         if expected != actual:

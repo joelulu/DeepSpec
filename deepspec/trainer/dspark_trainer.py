@@ -1,4 +1,5 @@
 import random
+from dataclasses import replace
 import torch
 
 from deepspec.data import CacheCollator
@@ -90,6 +91,16 @@ class Qwen3DSparkTrainer(BaseTrainer):
                 confidence_head_alpha=float(self.args.model.confidence_head_alpha),
                 metric_tag=f"train/loop{index + 1}",
             )
+            if output.side_aux_logits is not None:
+                alpha = float(self.draft_model.config.side_aux_loss_alpha)
+                aux_loss = compute_dspark_loss(
+                    outputs=replace(output, draft_logits=output.side_aux_logits,
+                                    side_aux_logits=None, aligned_target_logits=None),
+                    loss_decay_gamma=self.args.model.loss_decay_gamma,
+                    ce_loss_alpha=1.0, l1_loss_alpha=0.0, confidence_head_alpha=0.0,
+                    metric_tag="train/side_grouped",
+                )
+                exit_loss = exit_loss + alpha * aux_loss
             contribution = active_weights[index] / sum(active_weights) * exit_loss
             loss = loss + contribution
             add_metric("weighted_contribution", contribution, reduction="dp_mean", tag=f"train/loop{index + 1}")

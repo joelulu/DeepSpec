@@ -40,6 +40,8 @@ class DSparkForwardOutput:
     aligned_target_logits: Optional[torch.Tensor] = None
     # [batch_size, num_anchors], conditional stopping logit for this loop.
     exit_gate_logits: Optional[torch.Tensor] = None
+    # Provisional grouped-side logits, captured before token feedback.
+    side_aux_logits: Optional[torch.Tensor] = None
 
 
 class AcceptRatePredictor(nn.Module):

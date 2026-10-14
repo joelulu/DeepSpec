@@ -31,6 +31,7 @@ from deepspec.modeling.dspark.common import (
 from deepspec.modeling.dspark.markov_head import build_markov_head
 from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.modeling.dspark.ouro import validate_exit_config
+from deepspec.modeling.dspark.side_loop import SideFusion, forward_side_paths, validate_side_config
 from deepspec.utils.sampling import sample_tokens
 
 
@@ -283,6 +284,18 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         if self.num_loops < 1:
             raise ValueError("num_loops must be >= 1")
 
+        validate_side_config(config)
+        self.side_loop_mode = str(getattr(config, "side_loop_mode", "none"))
+        self.side_loop_steps = int(getattr(config, "side_loop_steps", 5))
+        self.side_group_size = int(getattr(config, "side_group_size", 3))
+        # Extra module construction must not shift the seed used by post_init
+        # for the five main layers in matched baseline/A/B experiments.
+        with torch.random.fork_rng(devices=[]):
+            self.side_fusion = (SideFusion(config.hidden_size, int(config.side_fusion_rank))
+                                if self.side_loop_mode != "none" else None)
+        self.side_execution = "serial"
+        self._side_aux_logits = None
+
         self.loop_boundary_norm = bool(getattr(config, "loop_boundary_norm", False))
         validate_exit_config(config)
         self.exit_gate = nn.Linear(config.hidden_size, 1) if getattr(config, "enable_exit_gate", False) else None
@@ -307,6 +320,11 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 input_dim += config.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
         self.post_init()
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if self.side_fusion is not None and module is self.side_fusion.up:
+            nn.init.zeros_(module.weight)
 
     def initialize_embeddings_and_head(
         self,
@@ -414,6 +432,14 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         min_exit_loop: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
+        if self.side_loop_mode != "none":
+            if num_loops not in (None, 1):
+                raise ValueError("Side loops use side_loop_steps; main num_loops must stay 1")
+            return forward_side_paths(self, position_ids=position_ids,
+                attention_mask=attention_mask, noise_embedding=noise_embedding,
+                target_hidden_states=target_hidden_states, past_key_values=past_key_values,
+                use_cache=use_cache, return_all_loop_hidden=return_all_loop_hidden,
+                exit_q=exit_q, min_exit_loop=min_exit_loop, **kwargs)
         diagnostics = kwargs.pop("diagnostics", False)
         diagnostic_mask = kwargs.pop("diagnostic_mask", None)
         hidden_states = noise_embedding
@@ -633,7 +659,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 confidence_pred=confidence_pred,
                 aligned_target_logits=aligned_target_logits,
                 exit_gate_logits=exit_gate_logits,
+                side_aux_logits=self._side_aux_logits,
             ))
+        self._side_aux_logits = None
         return tuple(outputs) if self.num_loops > 1 else outputs[0]
 
 
