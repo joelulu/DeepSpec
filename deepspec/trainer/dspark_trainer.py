@@ -95,7 +95,8 @@ class Qwen3DSparkTrainer(BaseTrainer):
                 alpha = float(self.draft_model.config.side_aux_loss_alpha)
                 aux_loss = compute_dspark_loss(
                     outputs=replace(output, draft_logits=output.side_aux_logits,
-                                    side_aux_logits=None, aligned_target_logits=None),
+                                    side_aux_logits=None, aligned_target_logits=None,
+                                    confidence_pred=None, exit_gate_logits=None),
                     loss_decay_gamma=self.args.model.loss_decay_gamma,
                     ce_loss_alpha=1.0, l1_loss_alpha=0.0, confidence_head_alpha=0.0,
                     metric_tag="train/side_grouped",

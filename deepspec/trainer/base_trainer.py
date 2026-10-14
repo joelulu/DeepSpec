@@ -297,6 +297,11 @@ class BaseTrainer:
                     continue
                 if getattr(source_config, key, default) != getattr(draft_model.config, key, default):
                     raise ValueError(f"Initialization checkpoint mismatch for {key}")
+            for key, default in (("markov_head_type", None), ("confidence_head_with_markov", False)):
+                if getattr(source_config, key, default) != getattr(draft_model.config, key, default):
+                    raise ValueError(f"Initialization checkpoint mismatch for {key}")
+            if hasattr(draft_model.config, "draft_algorithm"):
+                source_config.draft_algorithm = draft_model.config.draft_algorithm
             for key in ("enable_exit_gate", "ouro_training_mode", "min_exit_loop", "ouro_beta",
                         "gate_gain_slope", "gate_gain_threshold"):
                 setattr(source_config, key, getattr(draft_model.config, key))

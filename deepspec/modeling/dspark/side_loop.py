@@ -1,4 +1,4 @@
-"""Layer-1 side recurrence beside an unchanged five-layer DFlash stack.
+"""Layer-1 side recurrence beside a five-layer DFlash or DSpark stack.
 
 ``fusion`` has no intermediate vocabulary projection. ``grouped`` greedily
 decodes provisional groups, feeds their embeddings back according to the
@@ -33,8 +33,10 @@ def validate_side_config(config):
         return
     if int(config.num_hidden_layers) != 5 or int(getattr(config, "num_loops", 1)) != 1:
         raise ValueError("Side recurrence requires five main layers and num_loops=1")
-    if int(config.markov_rank) or bool(config.enable_confidence_head) or getattr(config, "enable_exit_gate", False):
-        raise ValueError("Side recurrence currently supports plain DFlash only")
+    if getattr(config, "enable_exit_gate", False):
+        raise ValueError("Side recurrence cannot use the Ouro exit gate")
+    if int(config.markov_rank) and str(config.markov_head_type) not in ("vanilla", "gated"):
+        raise ValueError("Side recurrence supports vanilla/gated DSpark Markov heads")
     for name in ("side_loop_steps", "side_group_size", "side_fusion_rank"):
         if int(getattr(config, name, SIDE_CONFIG_DEFAULTS[name])) < 1:
             raise ValueError(f"{name} must be positive")
@@ -85,11 +87,16 @@ class PathTimer:
 
 
 def prepare_paths(model, *, position_ids, noise_embedding, target_hidden_states,
-                  attention_mask=None, past_key_values=None, timer=None, **kwargs):
+                  attention_mask=None, past_key_values=None, timer=None,
+                  side_anchor_token_ids=None, **kwargs):
     if past_key_values is not None and not isinstance(past_key_values, ContextKVCache):
         raise ValueError("Side recurrence requires ContextKVCache; block KV must not persist")
     if noise_embedding.shape[1] % model.block_size:
         raise ValueError("Side recurrence requires complete anchor blocks")
+    if model.side_loop_mode == "grouped" and model.markov_head is not None:
+        shape = (noise_embedding.shape[0], noise_embedding.shape[1] // model.block_size)
+        if side_anchor_token_ids is None or tuple(side_anchor_token_ids.shape) != shape:
+            raise ValueError("Grouped DSpark requires given anchor IDs shaped [batch, blocks]")
     timer = timer or PathTimer(False, noise_embedding.device)
     with timer.stage("prepare"):
         context = model.hidden_norm(model.fc(target_hidden_states))
@@ -103,7 +110,7 @@ def prepare_paths(model, *, position_ids, noise_embedding, target_hidden_states,
     # Immutable input dictionary; both branches reuse context projections.
     return dict(context=context, rope=rope, projected=projected,
                 position_ids=position_ids, attention_mask=attention_mask,
-                noise=noise_embedding, layer_kwargs=kwargs, timer=timer)
+                noise=noise_embedding, anchors=side_anchor_token_ids, layer_kwargs=kwargs, timer=timer)
 
 
 def apply_layer(model, prepared, index, hidden):
@@ -144,6 +151,7 @@ def side_branch(model, prepared, first, collect_logits=False):
         # Slot zero always retains the known anchor embedding. No gold labels
         # enter this branch, in either training or evaluation.
         token_inputs = prepared["noise"].reshape(batch, blocks, model.block_size, width)
+        prev_ids = prepared["anchors"]
         for step in range(model.side_loop_steps):
             if step:
                 hidden = apply_layer(model, prepared, 0, hidden)
@@ -154,8 +162,20 @@ def side_branch(model, prepared, first, collect_logits=False):
             group = states[:, :, lo:hi]
             saved.append(group)  # capture BEFORE any feedback of this group
             with prepared["timer"].stage("intermediate_head"):
-                logits = model.compute_logits(model.norm(group))
-                ids = logits.detach().argmax(dim=-1)
+                group_hidden = model.norm(group)
+                logits = model.compute_logits(group_hidden)
+                if model.markov_head is None:
+                    ids = logits.detach().argmax(dim=-1)
+                else:
+                    # Flatten blocks as independent requests. Markov selection
+                    # uses the branch's provisional prefix, never gold tokens.
+                    ids, logits = model.sample_draft_tokens(
+                        logits.reshape(batch * blocks, model.side_group_size, -1),
+                        first_prev_token_ids=prev_ids.reshape(-1), temperature=0.0,
+                        hidden_states=group_hidden.reshape(batch * blocks, model.side_group_size, width))
+                    ids = ids.detach().reshape(batch, blocks, model.side_group_size)
+                    logits = logits.reshape(batch, blocks, model.side_group_size, -1)
+                    prev_ids = ids[:, :, -1]
             if collect_logits:
                 aux.append(logits)
             if step + 1 < model.side_loop_steps:
@@ -195,6 +215,8 @@ def run_paths(model, prepared, *, execution="serial", collect_logits=False):
         for tensor in (first, prepared["noise"], prepared["context"], prepared["position_ids"],
                        *prepared["rope"], *(t for pair in prepared["projected"] for t in pair)):
             tensor.record_stream(stream)
+        if prepared["anchors"] is not None:
+            prepared["anchors"].record_stream(stream)
         if torch.is_tensor(prepared["attention_mask"]):
             prepared["attention_mask"].record_stream(stream)
         with torch.cuda.stream(stream):

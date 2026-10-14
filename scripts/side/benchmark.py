@@ -93,6 +93,8 @@ def main():
         torch_version=torch.__version__, side_loop_mode=model.side_loop_mode,
         side_loop_steps=model.side_loop_steps, group_size=model.side_group_size,
         block_size=model.block_size, main_layers=5, shared_first_layer=True,
+        algorithm=getattr(model.config, "draft_algorithm", "dspark" if model.markov_head is not None else "dflash"),
+        markov_rank=model.config.markov_rank, confidence_head=model.confidence_head is not None,
         sample_from_anchor=model.sample_from_anchor,
         predicted_tokens=model.block_size - int(not model.sample_from_anchor),
         timing_only_adaptation=timing_adapted, args={**vars(args), "output": str(args.output)},
@@ -117,10 +119,19 @@ def main():
                     begin.record()
                     timer = PathTimer(profile, device)
                     prepared = prepare_paths(model, position_ids=positions, noise_embedding=noise,
-                        target_hidden_states=features, timer=timer, is_causal=False)
+                        target_hidden_states=features, timer=timer, is_causal=False,
+                        side_anchor_token_ids=ids[:, :1])
                     hidden, _ = run_paths(model, prepared, execution=execution)
                     with timer.stage("output_head"):
-                        tokens = model.compute_logits(hidden[:, int(not model.sample_from_anchor):]).argmax(dim=-1)
+                        proposal_hidden = hidden[:, int(not model.sample_from_anchor):]
+                        logits = model.compute_logits(proposal_hidden)
+                    with timer.stage("proposal_heads"):
+                        tokens, _ = model.sample_draft_tokens(logits,
+                            first_prev_token_ids=ids[:, 0], temperature=0.0,
+                            hidden_states=proposal_hidden)
+                        if model.confidence_head is not None:
+                            prev_ids = torch.cat((ids[:, :1], tokens[:, :-1]), dim=1)
+                            model.predict_confidence_step(proposal_hidden, prev_token_ids=prev_ids)
                     end.record()
                     torch.cuda.synchronize(device)
                     row = dict(execution=execution, gpu_total_ms=begin.elapsed_time(end),

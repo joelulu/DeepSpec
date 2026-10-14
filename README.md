@@ -1,103 +1,96 @@
-## Flexible looped DFlash experiments
+# DeepSpec side-loop experiments
 
-Block-level Ouro exit training and inference: see [baseline / A / B commands](docs/ouro_gate_training.md).
+This branch implements matched five-layer **DFlash and DSpark** experiments.
+Every block has **one given anchor and 15 predicted tokens** (`BLOCK_SIZE=16`).
+Old whole-stack-loop, Ouro, LoopCD and matrix shell launchers have been removed
+from this branch. Their earlier versions remain in Git history and on
+`research/loopd-flash`.
 
-Train with `bash train_dflash_loop.sh LAYERS LOOPS`; edit data percentage and
-budget in `scripts/loop/settings.sh`. Run `bash run_dflash_experiments.sh` for
-the five sequential eight-GPU, three-epoch comparisons, then
-`bash eval_temp.sh`. Start with `bash smoke_dflash_flex.sh` to check the actual
-GPU environment. See [configuration, metrics and audit](scripts/loop/FLEX_EXPERIMENTS.md).
-The older 3% pilot scripts below remain available but use their original settings.
+| Variant | Main path | Layer-1 side path |
+|---|---|---|
+| baseline | five layers | none |
+| A | five layers | five shared calls; hidden fusion, no intermediate head |
+| B | five layers | five shared calls; three provisional tokens per call, then hidden fusion |
 
-# DeepSpec
-
-DeepSpec is a full-stack codebase for training and evaluating draft models for speculative decoding. It contains data preparation utilities, draft model implementations, training code, and evaluation scripts.
-
-## Environment
-
-Install the Python dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-Data preparation additionally requires an inference engine to serve the target model when regenerating answers; see [scripts/data/README.md](./scripts/data/README.md) for details.
-
-## Workflow
-
-Run the stages in order — each stage's output feeds the next:
-
-1. **Data Preparation** — download prompts, regenerate target answers, and build the target cache.
-2. **Training** — train a draft model against the cached target outputs.
-3. **Evaluation** — measure speculative-decoding acceptance on benchmark tasks.
-
-## Data Preparation
-
-See [scripts/data/README.md](./scripts/data/README.md) for the step-by-step data pipeline:
-
-1. download and split training data,
-2. regenerate answers,
-3. prepare the target cache (storage warning: this can be very large — roughly 38 TB for the default `Qwen/Qwen3-4B` setting).
+The first layer-1 call is shared by both paths. DFlash disables Markov and
+confidence heads; DSpark enables the original vanilla Markov head (rank 256)
+and confidence head. Both algorithms keep the same anchor-excluded alignment.
 
 ## Training
 
-For Qwen3 depth/loop experiments (5L, 15L, shared 5L x 3) with existing target
-cache, see [LoopDFlash / LoopDSpark pilot](docs/loopd_flash.md).
-
-The fixed 3% DFlash pilot and same-prefix depth diagnostic are documented in
-[3% training and depth comparison](docs/loop_3pct_pilot.md). The launchers use
-`scripts/loop/settings_3pct.sh` for all paths and budgets:
+Activate your existing DeepSpec environment. Default settings in
+[`scripts/side/settings.sh`](scripts/side/settings.sh) are **eight GPUs, 3%
+data, three epochs**, batch 2/GPU and global batch 64. `SOURCE_CACHE` points to
+the existing target cache and can be overridden.
 
 ```bash
-bash smoke_dflash_loop.sh
-bash train_dflash_loop.sh 5l
-bash train_dflash_loop.sh 15l
-bash train_dflash_loop.sh loop5x3
-bash eval_dflash_loop.sh fixed
-bash eval_dflash_loop.sh prefix
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export DATA_PERCENT=3 EPOCHS=3
+export BLOCK_SIZE=16 SIDE_LOOPS=5 GROUP_SIZE=3
+export RUN_ROOT="$PWD/runs/side_p3_e3"
+
+bash train_dflash_side.sh baseline
+bash train_dflash_side.sh A
+bash train_dflash_side.sh B
+
+bash train_dspark_side.sh baseline
+bash train_dspark_side.sh A
+bash train_dspark_side.sh B
 ```
 
-Training automatically builds/reuses the same seed-42 random 3% cache subset.
-Tensor shards are referenced by symlink; the original cache is unchanged.
-Same-prefix oracle results are offline utility proxies, not dynamic-exit speedups.
-
-```bash
-bash scripts/train/train.sh
-```
-
-`train.sh` launches `train.py`, which spawns one worker per visible GPU. Select the algorithm and target model by pointing `config_path` at one of the configs under [config/](./config/) (e.g. `config/dspark/dspark_qwen3_4b.py`); see the script header for the full list of configs, how to override `config_path` / `target_cache_dir`, and how to use `--opts` to override individual config fields. Checkpoints are written to `~/checkpoints/<project_name>/<exp_name>/step_*`.
-
-Hardware: the default configs and scripts assume a single node with 8 GPUs. For fewer GPUs, reduce `CUDA_VISIBLE_DEVICES`.
-
+These are six independent commands; run the groups you need. Algorithm names
+are included in output directories to keep DFlash and DSpark checkpoints
+separate. Each launcher prints its exact `checkpoint_root`; the trained model
+is at `checkpoint_root/step_latest`.
 
 ## Evaluation
 
 ```bash
-bash scripts/eval/eval.sh
+export TARGET_MODEL=/home/jovyan/LMM/lmm_model/Qwen3-4B
+export EVAL_GPU=0 TASKS=gsm8k
+export MAX_SAMPLES=128 MAX_NEW_TOKENS=256
+export WARMUP_SAMPLES=3 EVAL_REPEATS=3
+
+bash eval_dflash_side.sh /path/to/dflash_baseline/step_latest serial
+bash eval_dflash_side.sh /path/to/dflash_A/step_latest both
+bash eval_dflash_side.sh /path/to/dflash_B/step_latest both
+
+bash eval_dspark_side.sh /path/to/dspark_baseline/step_latest serial
+bash eval_dspark_side.sh /path/to/dspark_A/step_latest both
+bash eval_dspark_side.sh /path/to/dspark_B/step_latest both
 ```
 
-`eval.sh` runs `eval.py` against a trained draft checkpoint over the speculative-decoding benchmarks in [eval_datasets/](./eval_datasets/) (gsm8k, math500, aime25, humaneval, mbpp, livecodebench, mt-bench, alpaca, arena-hard-v2). Set:
+`both` compares serial branches and actual CUDA-stream overlap. These are
+serial-request benchmarks on one GPU. DSpark defaults to
+`CONFIDENCE_THRESHOLD=0` to compare the full 15-token proposal; set a positive
+threshold to test confidence-based truncation. Evaluation reads architecture
+from the checkpoint and rejects an algorithm/checkpoint mismatch.
 
-- `target_name_or_path` — the target model the draft was trained against (e.g. `Qwen/Qwen3-4B`),
-- `draft_name_or_path` — the draft checkpoint, e.g. `~/checkpoints/deepspec/dspark_block7_qwen3_4b/step_latest`, or one of the Hugging Face repo IDs listed in [Released Checkpoints](#released-checkpoints).
+## Timing and implementation
 
-### Released Checkpoints
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/side/benchmark.py \
+  --draft /path/to/A_or_B/step_latest \
+  --contexts 1024,4096 --batches 1 --output runs/side_timing.json
+```
 
-The checkpoints below are the ones used for Table 1 in the [paper](https://arxiv.org/abs/2607.05147). Each checkpoint was trained on [open-perfectblend](https://huggingface.co/datasets/mlabonne/open-perfectblend) data generated by its corresponding target model in non-thinking mode, and is the direct output of the corresponding training configuration under [config/](./config/).
+This measures the five-layer main path, layer-1 recurrence, serial total and
+actual overlapping total. DSpark timings include Markov selection and
+confidence projection. Inspect `main_stack_5l_ms`, `side_loopN_ms`,
+`proposal_heads_ms` and `overlap_overhead_vs_main_pct`.
 
+See [exact token alignment, losses and debugging](docs/dflash_side_loop.md).
+Training/evaluation launchers and timing utilities are under `scripts/side/`;
+the common configuration is `config/side/qwen3_4b.py`. Both algorithms share
+`deepspec/modeling/dspark/qwen3/modeling.py`; DFlash is its head-disabled
+configuration. The actual side recurrence is in
+`deepspec/modeling/dspark/side_loop.py`.
 
-| Algorithm | `Qwen/Qwen3-4B` | `Qwen/Qwen3-8B` | `Qwen/Qwen3-14B` | `google/gemma-4-12B-it` |
-| --- | --- | --- | --- | --- |
-| Eagle3 | [deepseek-ai/eagle3_qwen3_4b_ttt7](https://huggingface.co/deepseek-ai/eagle3_qwen3_4b_ttt7) | [deepseek-ai/eagle3_qwen3_8b_ttt7](https://huggingface.co/deepseek-ai/eagle3_qwen3_8b_ttt7) | [deepseek-ai/eagle3_qwen3_14b_ttt7](https://huggingface.co/deepseek-ai/eagle3_qwen3_14b_ttt7) | [deepseek-ai/eagle3_gemma4_12b_ttt7](https://huggingface.co/deepseek-ai/eagle3_gemma4_12b_ttt7) |
-| DFlash | [deepseek-ai/dflash_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dflash_qwen3_4b_block7) | [deepseek-ai/dflash_qwen3_8b_block7](https://huggingface.co/deepseek-ai/dflash_qwen3_8b_block7) | [deepseek-ai/dflash_qwen3_14b_block7](https://huggingface.co/deepseek-ai/dflash_qwen3_14b_block7) | [deepseek-ai/dflash_gemma4_12b_block7](https://huggingface.co/deepseek-ai/dflash_gemma4_12b_block7) |
-| DSpark | [deepseek-ai/dspark_qwen3_4b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7) | [deepseek-ai/dspark_qwen3_8b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_8b_block7) | [deepseek-ai/dspark_qwen3_14b_block7](https://huggingface.co/deepseek-ai/dspark_qwen3_14b_block7) | [deepseek-ai/dspark_gemma4_12b_block7](https://huggingface.co/deepseek-ai/dspark_gemma4_12b_block7) |
+## Data preparation and environment
 
-> [!IMPORTANT]
-> If you cite these results in a new paper, align your setup with the training settings in this repository; otherwise, the comparison is not meaningful. For domain-specific use, fine-tune the draft model again for better results, especially if the target model is expected to run in thinking mode.
-
-## Supported Algorithms
-
-Currently, DeepSpec includes three draft models: [DSpark](https://arxiv.org/abs/2607.05147), [DFlash](https://arxiv.org/abs/2602.06036) and [Eagle3](https://arxiv.org/abs/2503.01840).
+Use your existing target cache. If creating a new one, see
+[scripts/data/README.md](scripts/data/README.md). The two data preparation shell
+scripts are retained. Dependencies are listed in `requirements.txt`.
 
 ## License
 

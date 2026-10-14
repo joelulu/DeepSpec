@@ -435,6 +435,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         return_all_loop_hidden: bool = False,
         exit_q: Optional[float] = None,
         min_exit_loop: Optional[int] = None,
+        side_anchor_token_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         if self.side_loop_mode != "none":
@@ -444,7 +445,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 attention_mask=attention_mask, noise_embedding=noise_embedding,
                 target_hidden_states=target_hidden_states, past_key_values=past_key_values,
                 use_cache=use_cache, return_all_loop_hidden=return_all_loop_hidden,
-                exit_q=exit_q, min_exit_loop=min_exit_loop, **kwargs)
+                exit_q=exit_q, min_exit_loop=min_exit_loop,
+                side_anchor_token_ids=side_anchor_token_ids, **kwargs)
         diagnostics = kwargs.pop("diagnostics", False)
         diagnostic_mask = kwargs.pop("diagnostic_mask", None)
         hidden_states = noise_embedding
@@ -564,6 +566,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
                 noise_embedding=noise_embedding,
                 target_hidden_states=target_hidden_states,
                 attention_mask=dspark_attn_mask,
+                side_anchor_token_ids=torch.gather(input_ids, 1, anchor_positions),
                 num_loops=num_loops,
                 return_all_loop_hidden=True,
                 diagnostics=diagnostics,

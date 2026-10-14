@@ -77,6 +77,7 @@ def build_draft_config(
             model_args.confidence_head_with_markov
         )
     draft_config.markov_rank = markov_rank
+    draft_config.draft_algorithm = str(model_args.get("algorithm", "dspark" if markov_rank else "dflash"))
     if markov_rank > 0:
         draft_config.markov_head_type = str(model_args.markov_head_type)
     from deepspec.modeling.dspark.side_loop import SIDE_CONFIG_DEFAULTS, validate_side_config

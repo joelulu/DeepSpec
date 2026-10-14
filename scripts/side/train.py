@@ -1,4 +1,4 @@
-"""Matched five-layer baseline, no-head fusion A, and grouped token-feedback B."""
+"""Matched DFlash / DSpark baseline, hidden fusion A, and token feedback B."""
 import argparse
 import json
 import os
@@ -8,12 +8,14 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.loop.launch_flex import build_launch
+from scripts.side.common import build_launch
 
 
-def build_side_launch(variant, env):
+def build_side_launch(variant, env, algorithm="dflash"):
     if variant not in ("baseline", "A", "B"):
         raise ValueError("variant must be baseline|A|B")
+    if algorithm not in ("dflash", "dspark"):
+        raise ValueError("algorithm must be dflash|dspark")
     plan, _, opts = build_launch(5, 1, env)
     steps, group = int(env.get("SIDE_LOOPS", "5")), int(env.get("GROUP_SIZE", "3"))
     block = int(env.get("BLOCK_SIZE", str(steps * group + 1 if variant == "B" else 16)))
@@ -25,9 +27,10 @@ def build_side_launch(variant, env):
     if variant == "B" and block - 1 != steps * group:
         raise ValueError("B requires BLOCK_SIZE-1=SIDE_LOOPS*GROUP_SIZE (default 16-1=5*3)")
     mode = {"baseline": "none", "A": "fusion", "B": "grouped"}[variant]
-    name = (f"dflash_side_{variant}_maskonly_b{block}_r{steps}_g{group}_k{rank}"
+    name = (f"{algorithm}_side_{variant}_maskonly_b{block}_r{steps}_g{group}_k{rank}"
             f"_p{plan['data_percent']}_e{plan['epochs']}_seed{env['SEED']}")
-    opts.update({"exp_name": name, "model.block_size": block,
+    dspark = algorithm == "dspark"
+    opts.update({"exp_name": name, "model.algorithm": algorithm, "model.block_size": block,
                  "model.sample_from_anchor": False,
                  "model.side_loop_mode": mode, "model.side_loop_steps": steps,
                  "model.side_group_size": group, "model.side_fusion_rank": rank,
@@ -37,15 +40,25 @@ def build_side_launch(variant, env):
                  "model.init_checkpoint": env.get("INIT_CHECKPOINT") or None,
                  "model.allow_block_size_transfer": bool(env.get("INIT_CHECKPOINT")),
                  "model.allow_prediction_convention_transfer": bool(env.get("INIT_CHECKPOINT")),
+                 "model.markov_rank": 256 if dspark else 0,
+                 "model.markov_head_type": "vanilla",
+                 "model.confidence_head_alpha": 1.0 if dspark else 0.0,
+                 "model.confidence_head_with_markov": dspark,
+                 "model.ce_loss_alpha": 0.1 if dspark else 1.0,
+                 "model.l1_loss_alpha": 0.9 if dspark else 0.0,
                  "logging.diagnostic_steps": 0})
     root = Path(plan["checkpoint_root"]).parents[1]
-    plan.update(experiment=name, variant=variant, block_size=block,
+    plan.update(experiment=name, algorithm=algorithm, variant=variant, block_size=block,
                 predicted_tokens=block - 1, sample_from_anchor=False,
                 side_loop_mode=mode, side_loop_steps=steps, group_size=group,
                 main_layers=5, shared_first_layer=True, side_execution_train="serial",
+                markov_rank=opts["model.markov_rank"], confidence_head=dspark,
+                loss=dict(ce=opts["model.ce_loss_alpha"], l1=opts["model.l1_loss_alpha"],
+                          confidence=opts["model.confidence_head_alpha"],
+                          side_ce=opts["model.side_aux_loss_alpha"] if variant == "B" else 0.0),
                 checkpoint_root=str(root / "deepspec" / name),
                 tensorboard=str(root / "tensorboard" / "deepspec" / name))
-    command = [sys.executable, "train.py", "--config", "config/loop/dflash_flex_qwen3_4b.py"]
+    command = [sys.executable, "train.py", "--config", "config/side/qwen3_4b.py"]
     for key, value in opts.items():
         command += ["--opts", key + "=" + json.dumps(value)]
     return plan, command, opts
@@ -54,8 +67,9 @@ def build_side_launch(variant, env):
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("variant", choices=("baseline", "A", "B"))
+    parser.add_argument("--algorithm", choices=("dflash", "dspark"), default="dflash")
     args = parser.parse_args()
-    plan, command, opts = build_side_launch(args.variant, os.environ)
+    plan, command, opts = build_side_launch(args.variant, os.environ, args.algorithm)
     print(json.dumps(plan, indent=2), flush=True)
     if os.environ.get("DRY_RUN") == "1":
         print(shlex.join(command))

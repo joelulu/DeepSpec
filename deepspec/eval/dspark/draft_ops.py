@@ -37,6 +37,7 @@ def forward_dspark_draft_block(
     ]
     backbone_kwargs = {}
     if isinstance(model, Qwen3DSparkModel):
+        backbone_kwargs["side_anchor_token_ids"] = draft_input_ids[:, ::model.block_size]
         backbone_kwargs["num_loops"] = getattr(model, "eval_num_loops", model.num_loops)
         if return_all_loop_hidden:
             backbone_kwargs["return_all_loop_hidden"] = True

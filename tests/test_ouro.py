@@ -315,12 +315,12 @@ def test_b_stops_on_joint_failure_and_chains_checkpoint(monkeypatch, tmp_path):
     assert calls[1] == ("gate_only", tmp_path / "joint" / "step_latest", "B_gate")
 
 
-def test_real_bash_entrypoints_dry_run_and_generated_training_options(tmp_path):
+def test_legacy_python_launchers_dry_run_and_generated_training_options(tmp_path):
     from deepspec.utils.config import load_config, parse_opts_to_config
     from deepspec.modeling.dspark.qwen3.config import build_draft_config
     root = Path(__file__).resolve().parents[1]
     env = dict(os.environ, **launch_environment(tmp_path), DRY_RUN="1", PYTHON=sys.executable)
-    result = subprocess.run(["bash", "train_dflash_loop.sh", "B", "1", "5"], cwd=root,
+    result = subprocess.run([sys.executable, "scripts/loop/launch_ouro.py", "B", "1", "5"], cwd=root,
         env=env, text=True, capture_output=True, check=True)
     decoder = json.JSONDecoder()
     first, end = decoder.raw_decode(result.stdout)
@@ -336,7 +336,7 @@ def test_real_bash_entrypoints_dry_run_and_generated_training_options(tmp_path):
         assert cfg.logging.checkpoint_dir.startswith(launch["overrides"]["run_root"])
     checkpoint = tmp_path / "checkpoint"; checkpoint.mkdir()
     (checkpoint / "config.json").write_text(json.dumps(dict(num_loops=5, enable_exit_gate=True, exit_gate_trained=True)))
-    result = subprocess.run(["bash", "eval_dflash_loop.sh", "both", str(checkpoint)], cwd=root,
+    result = subprocess.run([sys.executable, "scripts/loop/eval_ouro.py", "both", str(checkpoint)], cwd=root,
         env=dict(env, TARGET_MODEL="target", EVAL_REPEATS="1"), text=True, capture_output=True, check=True)
     plan = json.loads(result.stdout)
     assert len(plan["commands"]) == 8

@@ -16,8 +16,8 @@ from deepspec.eval.dspark.draft_ops import forward_dspark_draft_block, build_dsp
 from test_loop_qwen3 import config, dense_mask
 
 
-def side_config(mode="fusion", steps=5, block=15):
-    cfg = config(1)
+def side_config(mode="fusion", steps=5, block=15, dspark=False):
+    cfg = config(1, dspark=dspark)
     cfg.block_size = block
     cfg.side_loop_mode = mode
     cfg.side_loop_steps = steps
@@ -37,6 +37,7 @@ def data(model, ctx=8, blocks=1):
     ids = torch.full((1, blocks * model.block_size), model.mask_token_id)
     ids[:, ::model.block_size] = 2
     return dict(noise_embedding=model.embed_tokens(ids),
+                side_anchor_token_ids=ids[:, ::model.block_size],
                 target_hidden_states=torch.randn(1, ctx, 64),
                 position_ids=torch.cat((torch.arange(ctx),
                     torch.arange(ctx, ctx + model.block_size).repeat(blocks))).unsqueeze(0))
@@ -159,13 +160,14 @@ def test_context_cache_reused_once_per_layer_and_future_features_cannot_leak(mod
 
 @pytest.mark.parametrize("mode", ["fusion", "grouped"])
 @pytest.mark.parametrize("sample_from_anchor", [True, False])
-def test_speculative_greedy_output_matches_target(mode, sample_from_anchor):
+@pytest.mark.parametrize("dspark", [False, True])
+def test_speculative_greedy_output_matches_target(mode, sample_from_anchor, dspark):
     target_cfg = copy.deepcopy(config(1))
     target_cfg.num_hidden_layers = 4
     target_cfg.layer_types = ["full_attention"] * 4
     target = Qwen3ForCausalLM(target_cfg).eval()
     block = 6 + int(not sample_from_anchor)
-    draft_cfg = side_config(mode, steps=2, block=block)
+    draft_cfg = side_config(mode, steps=2, block=block, dspark=dspark)
     draft_cfg.sample_from_anchor = sample_from_anchor
     draft = Qwen3DSparkModel(draft_cfg).eval()
     with torch.no_grad():
@@ -207,7 +209,7 @@ def test_invalid_layout_and_cpu_overlap_are_rejected():
 
 
 def test_launch_defaults_and_equal_length_controls(tmp_path):
-    from scripts.loop.launch_side import build_side_launch
+    from scripts.side.train import build_side_launch
     source = tmp_path / "cache"; source.mkdir()
     (source / "manifest.json").write_text(json.dumps(dict(num_samples=10000,
         target_model_name_or_path="target", target_layer_ids=[0, 2])))
@@ -357,8 +359,11 @@ def test_anchor_excluded_proposal_contains_one_anchor_and_fifteen_predictions(mo
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA overlap requires GPU")
 @pytest.mark.parametrize("mode", ["fusion", "grouped"])
-def test_cuda_serial_overlap_hidden_and_cache_equivalence(mode):
-    model = Qwen3DSparkModel(side_config(mode)).to("cuda", dtype=torch.bfloat16).eval()
+@pytest.mark.parametrize("dspark", [False, True])
+def test_cuda_serial_overlap_hidden_and_cache_equivalence(mode, dspark):
+    cfg = side_config(mode, block=16, dspark=dspark)
+    cfg.sample_from_anchor = False
+    model = Qwen3DSparkModel(cfg).to("cuda", dtype=torch.bfloat16).eval()
     model.profile_side_paths = True
     with torch.no_grad():
         model.side_fusion.up.weight.fill_(0.03)

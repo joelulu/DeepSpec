@@ -101,6 +101,12 @@ def load_resume_draft_model(
         actual = getattr(resumed_model.config, key, default)
         if expected != actual:
             raise ValueError(f"Resume model mismatch for {key}: checkpoint={actual}, requested={expected}")
+    for key, default in (("markov_rank", 0), ("markov_head_type", None),
+                         ("enable_confidence_head", False), ("confidence_head_with_markov", False)):
+        expected = getattr(draft_model.config, key, default)
+        actual = getattr(resumed_model.config, key, default)
+        if expected != actual:
+            raise ValueError(f"Resume model mismatch for {key}: checkpoint={actual}, requested={expected}")
     resumed_model = resumed_model.to(device=device, dtype=precision_dtype)
     resumed_model.set_embedding_head_trainable(False)
     return resumed_model

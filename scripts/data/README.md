@@ -120,7 +120,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/data/prepare_target_cache.py
 > use a smaller training set and/or reduce `model.target_layer_ids` in the config
 > (fewer captured layers means proportionally less cache).
 
-This produces the cache consumed by [scripts/train/train.sh](../train/train.sh):
+This produces the cache consumed by [train_dflash_side.sh](../../train_dflash_side.sh)
+or [train_dspark_side.sh](../../train_dspark_side.sh). Set `SOURCE_CACHE` to:
 
 ```text
 ~/.cache/deepspec/qwen3_4b_target_cache
