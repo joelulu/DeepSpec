@@ -44,7 +44,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
 
     @property
     def max_proposal_tokens(self) -> int:
-        return int(self.draft_model.block_size)
+        return int(self.draft_model.block_size) - int(not getattr(self.draft_model, "sample_from_anchor", True))
 
     def _build_confidence_head_recorder(self) -> ConfidenceHeadRecorder | None:
         if self.draft_model.confidence_head is None:
@@ -146,8 +146,9 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
         stop_token_ids: list[int] | None = None,
     ) -> DraftProposal:
         model = self.draft_model
+        input_block_size = int(model.block_size)
         draft_input_ids = torch.full(
-            (output_ids.size(0), self.max_proposal_tokens),
+            (output_ids.size(0), input_block_size),
             int(model.mask_token_id),
             dtype=torch.long,
             device=output_ids.device,
@@ -161,7 +162,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             past_key_values_draft=context.past_key_values_draft,
             target_hidden_states=context.target_hidden_states,
             start=start,
-            block_size=self.max_proposal_tokens,
+            block_size=input_block_size,
             return_all_loop_hidden=loopcd is not None,
         )
         early_block_hidden = None
@@ -175,7 +176,7 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
             model=model,
             draft_input_ids=draft_input_ids,
             block_hidden=block_hidden,
-            block_size=self.max_proposal_tokens,
+            block_size=input_block_size,
             temperature=float(self.args.temperature),
             confidence_threshold=float(self.args.confidence_threshold),
             loopcd=loopcd,

@@ -32,6 +32,8 @@ def main():
                 loopcd_alpha=payload["args"].get("loopcd_alpha", "") if payload["args"].get("loopcd", False) else "",
                 num_layers=payload["num_draft_layers"], num_loops=payload["num_loops"],
                 block_size=payload.get("block_size", ""),
+                sample_from_anchor=payload.get("sample_from_anchor", True),
+                predicted_tokens=payload.get("predicted_tokens", ""),
                 side_loop_mode=payload.get("side_loop_mode", "none"),
                 side_loop_steps=payload.get("side_loop_steps", 0),
                 side_execution=payload.get("side_execution", "serial"),

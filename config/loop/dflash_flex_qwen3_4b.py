@@ -11,6 +11,7 @@ run_root = None
 model = dict(
     target_model_name_or_path=QWEN_3_4B,
     block_size=7,
+    sample_from_anchor=True,  # legacy; launch_side explicitly sets False
     num_draft_layers=5,
     num_loops=1,
     loop_loss_weights=[1.0],
@@ -24,6 +25,7 @@ model = dict(
     side_fusion_rank=128,
     side_aux_loss_alpha=0.2,
     allow_block_size_transfer=False,
+    allow_prediction_convention_transfer=False,
     # Ouro adaptation; disabled by default to preserve legacy experiments.
     enable_exit_gate=False,
     ouro_training_mode="baseline",

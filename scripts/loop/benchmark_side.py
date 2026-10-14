@@ -37,6 +37,7 @@ def load_model(args, device):
             setattr(config, key, default)
     if args.variant:
         config.side_loop_mode = {"A": "fusion", "B": "grouped"}[args.variant]
+        config.sample_from_anchor = False
     if config.side_loop_mode == "none":
         raise ValueError("Use an A/B checkpoint, or --variant A|B for timing-only baseline adaptation")
     if args.side_loops is not None:
@@ -44,7 +45,7 @@ def load_model(args, device):
     if args.group_size is not None:
         config.side_group_size = args.group_size
     if config.side_loop_mode == "grouped":
-        config.block_size = config.side_loop_steps * config.side_group_size
+        config.block_size = config.side_loop_steps * config.side_group_size + int(not getattr(config, "sample_from_anchor", True))
     if args.block_size is not None:
         config.block_size = args.block_size
     config.num_loops = 1
@@ -92,6 +93,8 @@ def main():
         torch_version=torch.__version__, side_loop_mode=model.side_loop_mode,
         side_loop_steps=model.side_loop_steps, group_size=model.side_group_size,
         block_size=model.block_size, main_layers=5, shared_first_layer=True,
+        sample_from_anchor=model.sample_from_anchor,
+        predicted_tokens=model.block_size - int(not model.sample_from_anchor),
         timing_only_adaptation=timing_adapted, args={**vars(args), "output": str(args.output)},
         scope="synthetic full-context batch, SDPA, no target verification; not quality or serving throughput",
         results=[])
@@ -117,7 +120,7 @@ def main():
                         target_hidden_states=features, timer=timer, is_causal=False)
                     hidden, _ = run_paths(model, prepared, execution=execution)
                     with timer.stage("output_head"):
-                        tokens = model.compute_logits(hidden).argmax(dim=-1)
+                        tokens = model.compute_logits(hidden[:, int(not model.sample_from_anchor):]).argmax(dim=-1)
                     end.record()
                     torch.cuda.synchronize(device)
                     row = dict(execution=execution, gpu_total_ms=begin.elapsed_time(end),

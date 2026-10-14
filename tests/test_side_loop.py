@@ -158,12 +158,16 @@ def test_context_cache_reused_once_per_layer_and_future_features_cannot_leak(mod
 
 
 @pytest.mark.parametrize("mode", ["fusion", "grouped"])
-def test_speculative_greedy_output_matches_target(mode):
+@pytest.mark.parametrize("sample_from_anchor", [True, False])
+def test_speculative_greedy_output_matches_target(mode, sample_from_anchor):
     target_cfg = copy.deepcopy(config(1))
     target_cfg.num_hidden_layers = 4
     target_cfg.layer_types = ["full_attention"] * 4
     target = Qwen3ForCausalLM(target_cfg).eval()
-    draft = Qwen3DSparkModel(side_config(mode, steps=2, block=6)).eval()
+    block = 6 + int(not sample_from_anchor)
+    draft_cfg = side_config(mode, steps=2, block=block)
+    draft_cfg.sample_from_anchor = sample_from_anchor
+    draft = Qwen3DSparkModel(draft_cfg).eval()
     with torch.no_grad():
         draft.side_fusion.up.weight.fill_(0.03)
     prompt = torch.tensor([[2, 7, 9, 3]])
@@ -171,11 +175,11 @@ def test_speculative_greedy_output_matches_target(mode):
         return SimpleNamespace(past_key_values_draft=ContextKVCache(),
             target_hidden_states=extract_context_feature(initial_output.hidden_states, draft.target_layer_ids))
     def propose(context, output_ids, position_ids, start, stop_token_ids):
-        ids = torch.full((1, 6), 63); ids[:, 0] = output_ids[:, start]
+        ids = torch.full((1, block), 63); ids[:, 0] = output_ids[:, start]
         hidden = forward_dspark_draft_block(draft, draft_input_ids=ids, position_ids=position_ids,
             past_key_values_draft=context.past_key_values_draft, target_hidden_states=context.target_hidden_states,
-            start=start, block_size=6)
-        return build_dspark_proposal(draft, draft_input_ids=ids, block_hidden=hidden, block_size=6,
+            start=start, block_size=block)
+        return build_dspark_proposal(draft, draft_input_ids=ids, block_hidden=hidden, block_size=block,
                                     temperature=0.0, confidence_threshold=0.0)
     def update(context, verification):
         context.target_hidden_states = extract_context_feature(verification.target_output.hidden_states,
@@ -211,15 +215,16 @@ def test_launch_defaults_and_equal_length_controls(tmp_path):
         EPOCHS="1", LOCAL_BATCH="2", GLOBAL_BATCH="64", LOOP_TRANSFER="raw", LOOP_LOSS="final",
         RUN_ROOT=str(tmp_path / "runs"), ANCHORS="2", LOG_EVERY="5", DIAGNOSTIC_EVERY="0",
         LR="0.0006", SHARDING="no_shard")
-    for variant, block in (("baseline", 16), ("A", 16), ("B", 15)):
+    for variant, block in (("baseline", 16), ("A", 16), ("B", 16)):
         plan, command, opts = build_side_launch(variant, env)
         assert opts["model.num_draft_layers"] == 5 and opts["model.num_loops"] == 1
         assert plan["block_size"] == block
+        assert plan["predicted_tokens"] == 15 and opts["model.sample_from_anchor"] is False
         assert Path(plan["checkpoint_root"]).parent == tmp_path / "runs" / "deepspec"
     _, _, opts = build_side_launch("A", dict(env, BLOCK_SIZE="15"))
     assert opts["model.block_size"] == 15
     with pytest.raises(ValueError, match="BLOCK_SIZE"):
-        build_side_launch("B", dict(env, BLOCK_SIZE="16"))
+        build_side_launch("B", dict(env, BLOCK_SIZE="15"))
 
 
 @pytest.mark.parametrize("mode", ["fusion", "grouped"])
@@ -258,6 +263,96 @@ def test_group_auxiliary_loss_runs_through_real_trainer(monkeypatch):
     assert torch.isfinite(loss)
     loss.backward()
     assert model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("mode", ["none", "fusion", "grouped"])
+def test_anchor_excluded_labels_mask_and_real_trainer_objective(monkeypatch, mode):
+    import torch.distributed as dist
+    import deepspec.modeling.dspark.qwen3.modeling as modeling
+    from deepspec.trainer.dspark_trainer import Qwen3DSparkTrainer
+    from deepspec.utils.config import load_config
+
+    monkeypatch.setattr(modeling, "create_dspark_attention_mask", dense_mask)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+    anchors = torch.tensor([[2, 4]])
+    monkeypatch.setattr(modeling, "sample_anchor_positions", lambda **kwargs:
+                        (anchors, torch.ones_like(anchors, dtype=torch.bool)))
+    cfg = side_config(mode, steps=5, block=16)
+    cfg.sample_from_anchor = False
+    model = Qwen3DSparkModel(cfg).train()
+    model.set_embedding_head_trainable(False)
+    batch = dict(input_ids=torch.arange(24).unsqueeze(0),
+                 loss_mask=torch.ones(1, 24),
+                 target_hidden_states=torch.randn(1, 24, 64))
+    captured = []
+    model.register_forward_hook(lambda module, args, output: captured.append(output))
+    args = load_config("config/loop/dflash_flex_qwen3_4b.py")
+    trainer = SimpleNamespace(draft_model=model, model=model, args=args,
+        global_step=0, next_micro_step=0, global_rank=0, world_size=1,
+        gradient_accumulation_steps=1)
+    loss = Qwen3DSparkTrainer.run_batch(trainer, batch)
+    output = captured[0]
+    assert not output.eval_mask[:, :, 0].any()
+    assert output.eval_mask[:, :, 1:].all()
+    torch.testing.assert_close(output.target_ids,
+        anchors.unsqueeze(-1) + torch.arange(16).reshape(1, 1, -1))
+    weights = output.eval_mask.float() * torch.exp(-torch.arange(16).float() / 4)
+    def weighted_ce(logits):
+        ce = F.cross_entropy(logits.flatten(0, 2), output.target_ids.flatten(),
+                             reduction="none").reshape_as(weights)
+        return (ce * weights).sum() / (weights.sum() + 1e-6)
+    expected = weighted_ce(output.draft_logits)
+    if mode == "grouped":
+        assert output.side_aux_logits.shape == output.draft_logits.shape
+        expected = expected + 0.2 * weighted_ce(output.side_aux_logits)
+    else:
+        assert output.side_aux_logits is None
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert model.layers[0].self_attn.q_proj.weight.grad.abs().sum() > 0
+    assert model.lm_head.weight.grad is None
+
+
+def test_anchor_excluded_group_feedback_is_same_position_across_blocks(monkeypatch):
+    cfg = side_config("grouped", steps=2, block=7)
+    cfg.sample_from_anchor = False
+    model = Qwen3DSparkModel(cfg).eval()
+    captured, outputs = [], []
+    model.layers[0].register_forward_pre_hook(lambda module, args, kwargs:
+        captured.append(kwargs["hidden_states"].detach().clone()), with_kwargs=True)
+    model.layers[0].register_forward_hook(lambda module, args, output:
+        outputs.append(output.detach().clone()))
+    def forced_logits(hidden):
+        ids = torch.tensor([[[7, 8, 9], [10, 11, 12]]])
+        return hidden.new_zeros(*hidden.shape[:-1], 64).scatter(-1, ids.unsqueeze(-1), 100)
+    monkeypatch.setattr(model, "compute_logits", forced_logits)
+    with torch.no_grad():
+        model._forward_backbone(**data(model, blocks=2))
+    second = captured[1].reshape(1, 2, 7, 32)
+    torch.testing.assert_close(second[:, :, 1:4],
+        model.embed_tokens(torch.tensor([[[7, 8, 9], [10, 11, 12]]])))
+    torch.testing.assert_close(second[:, :, 0], model.embed_tokens(torch.tensor([[2, 2]])))
+    torch.testing.assert_close(second[:, :, 4:], outputs[0].reshape(1, 2, 7, 32)[:, :, 4:])
+
+
+@pytest.mark.parametrize("mode", ["none", "fusion", "grouped"])
+def test_anchor_excluded_proposal_contains_one_anchor_and_fifteen_predictions(mode):
+    from deepspec.eval.dspark.evaluator import Qwen3DSparkEvaluator
+    cfg = side_config(mode, block=16)
+    cfg.sample_from_anchor = False
+    draft = Qwen3DSparkModel(cfg).eval()
+    ids = torch.full((1, 16), 63)
+    ids[:, 0] = 2
+    with torch.no_grad():
+        hidden = draft._forward_backbone(**data(draft))
+        proposal = build_dspark_proposal(draft, draft_input_ids=ids,
+            block_hidden=hidden, block_size=16, temperature=0.0, confidence_threshold=0.0)
+    assert proposal.draft_token_count == 15
+    assert proposal.verify_input_ids.shape == (1, 16)
+    assert proposal.verify_input_ids[0, 0] == 2
+    assert proposal.draft_probs.shape == (1, 15, 64)
+    evaluator = SimpleNamespace(draft_model=draft)
+    assert Qwen3DSparkEvaluator.max_proposal_tokens.fget(evaluator) == 15
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA overlap requires GPU")

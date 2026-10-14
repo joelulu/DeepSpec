@@ -278,6 +278,11 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.block_size = int(config.block_size)
+        # Missing field preserves old DSpark-style checkpoints. New side-loop
+        # experiments explicitly use the original DFlash anchor convention.
+        self.sample_from_anchor = bool(getattr(config, "sample_from_anchor", True))
+        if not self.sample_from_anchor and self.block_size < 2:
+            raise ValueError("DFlash block requires an anchor plus at least one MASK")
         self.mask_token_id = config.mask_token_id
         self.num_anchors = int(config.num_anchors)
         self.num_loops = int(getattr(config, "num_loops", 1))
@@ -567,7 +572,8 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
 
         num_blocks = anchor_positions.size(1)
 
-        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
+        label_start = 1 if self.sample_from_anchor else 0
+        label_offsets = torch.arange(label_start, self.block_size + label_start, device=device).view(
             1, 1, -1
         )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
@@ -608,6 +614,10 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             safe_label_indices=safe_label_indices,
             block_keep_mask=block_keep_mask,
         )
+        if not self.sample_from_anchor:
+            # Build the contiguous valid prefix first, THEN exclude the anchor;
+            # excluding it before cumprod would erase every supervision token.
+            eval_mask = eval_mask & (torch.arange(self.block_size, device=device) > 0)
         anchor_token_ids = torch.gather(
             input_ids,
             1,

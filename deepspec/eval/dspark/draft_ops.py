@@ -123,13 +123,15 @@ def build_dspark_proposal(
     assert draft_input_ids.size(0) == 1, "build_dspark_proposal requires batch_size=1"
     if (loopcd is None) != (early_block_hidden is None):
         raise ValueError("LoopCD config and early hidden states must be supplied together")
-    proposal_hidden_states = block_hidden[:, :block_size, :]
+    output_start = int(not getattr(model, "sample_from_anchor", True))
+    proposal_size = int(block_size) - output_start
+    proposal_hidden_states = block_hidden[:, output_start:block_size, :]
     base_draft_logits = model.compute_logits(proposal_hidden_states)
     if loopcd is not None:
         if not isinstance(model, Qwen3DSparkModel):
             raise ValueError("LoopCD currently supports Qwen3 only")
         loopcd.validate_model(model, getattr(model, "eval_num_loops", model.num_loops))
-        early_logits = model.compute_logits(early_block_hidden[:, :block_size, :])
+        early_logits = model.compute_logits(early_block_hidden[:, output_start:block_size, :])
         base_draft_logits = loopcd_logits(base_draft_logits, early_logits, loopcd)
     sampled_tokens, draft_logits = model.sample_draft_tokens(
         base_draft_logits,
@@ -138,7 +140,7 @@ def build_dspark_proposal(
         hidden_states=proposal_hidden_states,
     )
 
-    proposal_draft_tokens = int(block_size)
+    proposal_draft_tokens = proposal_size
     confidence_logits = None
     if model.confidence_head is not None:
         confidence_logits = _predict_confidence_logits(
@@ -146,13 +148,13 @@ def build_dspark_proposal(
             proposal_hidden_states=proposal_hidden_states,
             draft_input_ids=draft_input_ids,
             sampled_tokens=sampled_tokens,
-            block_size=block_size,
+            block_size=proposal_size,
         )
         if confidence_logits is None:
             return _empty_dspark_proposal(draft_input_ids)
         proposal_draft_tokens = _confident_prefix_length(
             confidence_logits,
-            block_size=block_size,
+            block_size=proposal_size,
             threshold=float(confidence_threshold),
         )
 

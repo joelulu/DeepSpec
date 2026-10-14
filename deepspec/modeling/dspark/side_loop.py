@@ -1,8 +1,8 @@
 """Layer-1 side recurrence beside an unchanged five-layer DFlash stack.
 
 ``fusion`` has no intermediate vocabulary projection. ``grouped`` greedily
-decodes provisional groups, feeds their embeddings back with the repository's
-next-token shift, and fuses pre-feedback states at the end. Final proposals are
+decodes provisional groups, feeds their embeddings back according to the
+checkpoint's prediction convention, and fuses pre-feedback states at the end. Final proposals are
 resampled from the fused head; provisional tokens are NOT the final AR prefix.
 """
 from __future__ import annotations
@@ -41,8 +41,9 @@ def validate_side_config(config):
     alpha = float(getattr(config, "side_aux_loss_alpha", 0.2))
     if not math.isfinite(alpha) or alpha < 0:
         raise ValueError("side_aux_loss_alpha must be finite and nonnegative")
-    if mode == "grouped" and int(config.block_size) != int(config.side_loop_steps) * int(config.side_group_size):
-        raise ValueError("grouped requires block_size = side_loop_steps * side_group_size")
+    anchor_slots = int(not getattr(config, "sample_from_anchor", True))
+    if mode == "grouped" and int(config.block_size) - anchor_slots != int(config.side_loop_steps) * int(config.side_group_size):
+        raise ValueError("grouped requires predicted slots = side_loop_steps * side_group_size; block_size includes the given anchor when sample_from_anchor=False")
 
 
 class SideFusion(nn.Module):
@@ -138,7 +139,8 @@ def side_branch(model, prepared, first, collect_logits=False):
         batch, length, width = hidden.shape
         blocks = length // model.block_size
         saved, aux = [], []
-        # The shifted block input slot j contains x_j and predicts x_{j+1}.
+        # Original DFlash: slot j predicts x_j, slot zero is the given anchor.
+        # Legacy DSpark: slot j predicts x_{j+1}, so feedback is shifted by one.
         # Slot zero always retains the known anchor embedding. No gold labels
         # enter this branch, in either training or evaluation.
         token_inputs = prepared["noise"].reshape(batch, blocks, model.block_size, width)
@@ -146,7 +148,8 @@ def side_branch(model, prepared, first, collect_logits=False):
             if step:
                 hidden = apply_layer(model, prepared, 0, hidden)
             states = hidden.reshape(batch, blocks, model.block_size, width)
-            lo = step * model.side_group_size
+            output_start = int(not model.sample_from_anchor)
+            lo = output_start + step * model.side_group_size
             hi = lo + model.side_group_size
             group = states[:, :, lo:hi]
             saved.append(group)  # capture BEFORE any feedback of this group
@@ -156,14 +159,20 @@ def side_branch(model, prepared, first, collect_logits=False):
             if collect_logits:
                 aux.append(logits)
             if step + 1 < model.side_loop_steps:
-                # x_{lo+1:hi+1} goes into input positions lo+1:hi+1.
-                token_inputs = torch.cat((token_inputs[:, :, :lo + 1],
+                shift = int(model.sample_from_anchor)
+                token_inputs = torch.cat((token_inputs[:, :, :lo + shift],
                                           model.embed_tokens(ids),
-                                          token_inputs[:, :, hi + 1:]), dim=2)
-                known = torch.arange(model.block_size, device=hidden.device) <= hi
+                                          token_inputs[:, :, hi + shift:]), dim=2)
+                known = torch.arange(model.block_size, device=hidden.device) < hi + shift
                 states = torch.where(known[None, None, :, None], token_inputs, states)
                 hidden = states.reshape(batch, length, width)
-        return torch.cat(saved, dim=2).reshape(batch, length, width), (torch.cat(aux, dim=2) if aux else None)
+        side = torch.cat(saved, dim=2)
+        aux_logits = torch.cat(aux, dim=2) if aux else None
+        if not model.sample_from_anchor:
+            side = torch.cat((first.reshape(batch, blocks, model.block_size, width)[:, :, :1], side), dim=2)
+            if aux_logits is not None:
+                aux_logits = torch.cat((aux_logits.new_zeros(batch, blocks, 1, aux_logits.shape[-1]), aux_logits), dim=2)
+        return side.reshape(batch, length, width), aux_logits
 
 
 def run_paths(model, prepared, *, execution="serial", collect_logits=False):

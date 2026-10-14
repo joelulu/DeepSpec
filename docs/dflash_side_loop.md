@@ -12,15 +12,22 @@ calls to layer 1 and one call each to layers 2–5 (nine layer calls in total).
 
 | Experiment | Default block | Side path | Final prediction |
 |---|---:|---|---|
-| baseline | 16 | none | main hidden → norm → head |
-| A | 16 | layer 1, five total calls, no intermediate head | residual MLP fusion of final side/main hidden → norm → head |
-| B | 15 | five calls, each predicts three provisional tokens and feeds back embeddings | fusion of each group's pre-feedback hidden/main hidden → norm → head |
+| baseline | 16 (anchor + 15 predictions) | none | main hidden → norm → head |
+| A | 16 (anchor + 15 predictions) | layer 1, five total calls, no intermediate head | residual MLP fusion of final side/main hidden → norm → head |
+| B | 16 (anchor + 15 predictions) | five calls, each predicts three provisional tokens and feeds back embeddings | fusion of each group's pre-feedback hidden/main hidden → norm → head |
 
-This repository uses the DSpark-style shifted prediction convention even when
-the Markov/confidence heads are disabled: input `[anchor, MASK, …]` of length
-`S` predicts **S future tokens**. Input position `j` predicts `x[j+1]`.
-Consequently, a group predicted from positions `0:3` is fed into input positions
-`1:4`, not `0:3`. The anchor stays at input slot 0. Positions do not slide.
+These experiments explicitly set `sample_from_anchor=False`: input
+`[anchor, MASK, …]` has 16 positions and only positions `1:16` predict tokens.
+Position 0 is given, excluded from the loss, and never sampled. Group 1 uses
+positions `1:4`; its predicted embeddings are fed back into those same positions.
+The anchor stays at input slot 0. Positions do not slide.
+
+Legacy DeepSpec checkpoints keep their shifted prediction convention when the
+field is absent or true: the default parameter `block_size=7` produces seven
+draft candidates, and the target verifier reads eight positions including the
+given anchor. Its draft tensor itself has seven positions because slot 0 also
+predicts the next token. Do not confuse that parameter with the total-position
+convention used by the new side-loop launcher.
 
 In B, the first shared call already emits group 1. Thus five calls × three
 positions = 15 proposals. This differs from a schedule with an initialization
@@ -42,6 +49,31 @@ same cached target data. B feeds back its **own predictions in training**, not
 gold tokens, and adds a weighted CE on pre-feedback group logits (default 0.2).
 There is no gold-token leakage through feedback. The early group loss helps
 train layer-1 outputs to use the frozen target head.
+
+### Training losses
+
+All three variants use hard-token cross-entropy with the existing position
+decay, `w[j] = exp(-j / 4)`, normalized by the sum of valid token weights.
+Only predicted positions `1:16` participate; padding, invalid positions, and
+the anchor are excluded.
+
+| Variant | Objective |
+|---|---|
+| baseline | weighted CE of the final layer-5 output |
+| A | weighted CE of the final fused output; no per-loop auxiliary CE |
+| B | weighted CE of the final fused output + `SIDE_AUX_ALPHA` × weighted CE of the pre-feedback group predictions |
+
+`SIDE_AUX_ALPHA` defaults to `0.2`. B concatenates each of the five groups'
+three logits at its original position, then computes one normalized auxiliary
+CE across the 15 predictions. It does not sum five separately averaged losses.
+Feedback uses detached greedy predictions; gradients still flow through the
+group logits and fused output to the shared layer. Target embedding/head
+weights stay frozen, and there is no KL, probability L1, confidence, or router
+loss in these experiments. A/B train the main layers and fusion jointly.
+For the auxiliary-loss ablation use
+`SIDE_AUX_ALPHA=0 RUN_ROOT="$PWD/runs/dflash_side_aux0" bash train_dflash_side.sh B`;
+the intermediate heads and predicted-token feedback still run. Use a separate
+run root because resuming requires the original auxiliary-loss weight.
 
 ## Quick training
 
@@ -86,20 +118,24 @@ export INIT_CHECKPOINT=/path/to/trained_5layer_dflash/step_latest
 ```
 
 The target, dimensions, target feature layers and mask token must match. This
-launcher explicitly allows changing the block size (e.g. 7 → 16/15), which has
+launcher explicitly allows changing the block size (e.g. 7 → 16), which has
 no associated learned weight shape, and adds only the missing fusion weights.
+It also explicitly permits changing from the legacy shifted prediction
+convention to the new anchor-excluded convention. This changes label alignment;
+warm-started weights must be trained before making quality claims.
 Warm-starting from a 1-layer or a whole-stack multi-loop checkpoint is rejected.
 Auto-resume requires matching side architecture settings and its original run.
 
-For a fair A/B quality comparison, also train matched 15-position controls:
+All three defaults already have matched prediction counts:
 
 ```bash
-BLOCK_SIZE=15 bash train_dflash_side.sh baseline
-BLOCK_SIZE=15 bash train_dflash_side.sh A
+BLOCK_SIZE=16 bash train_dflash_side.sh baseline
+BLOCK_SIZE=16 bash train_dflash_side.sh A
+BLOCK_SIZE=16 bash train_dflash_side.sh B
 ```
 
-Primary comparison: baseline16 vs A16; baseline15 vs A15 vs B15. Do not
-attribute differences between A16 and B15 entirely to the architecture.
+Primary comparison: baseline16 vs A16 vs B16, each predicting 15 new tokens.
+B requires `BLOCK_SIZE - 1 = SIDE_LOOPS * GROUP_SIZE` (default `16 - 1 = 5 * 3`).
 Keep training data, optimizer, steps, seed, generation task and prompt set fixed.
 
 ## Quality and complete draft–verify timing
@@ -198,13 +234,13 @@ load must be measured separately. Reduce batches/contexts if the benchmark OOMs.
 python -m pytest tests/test_side_loop.py tests/test_loop_qwen3.py -q
 ```
 
-CPU tests cover unchanged initial output, exact layer/head counts, shifted group
+CPU tests cover unchanged initial output, exact layer/head counts, legacy shifted and new same-position group
 feedback across multiple blocks, gradients including activation checkpointing,
 checkpoint roundtrip, incremental context reuse, future-context masking and
 greedy target-output equivalence. Two additional tests require CUDA to check
 serial/overlap hidden and cache equivalence. They are skipped on a CPU host.
 
 Breakpoints: `side_loop.py:side_branch` at `group = ...` to inspect pre-feedback
-states and at `token_inputs = ...` to inspect shifted token feedback;
+states and at `token_inputs = ...` to inspect token feedback;
 `run_paths` at `model.side_fusion(main, side)` to inspect the two hidden tensors.
 Training always runs serial; overlap is explicitly CUDA inference-only.

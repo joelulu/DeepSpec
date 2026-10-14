@@ -301,6 +301,11 @@ class BaseTrainer:
                         "gate_gain_slope", "gate_gain_threshold"):
                 setattr(source_config, key, getattr(draft_model.config, key))
             source_config.loop_loss_weights = draft_model.config.loop_loss_weights
+            source_sampling = bool(getattr(source_config, "sample_from_anchor", True))
+            requested_sampling = bool(getattr(draft_model.config, "sample_from_anchor", True))
+            if source_sampling != requested_sampling and not model_args.get("allow_prediction_convention_transfer", False):
+                raise ValueError("Initialization checkpoint mismatch for sample_from_anchor")
+            source_config.sample_from_anchor = requested_sampling
             from deepspec.modeling.dspark.side_loop import SIDE_CONFIG_DEFAULTS
             source_side = getattr(source_config, "side_loop_mode", "none")
             requested_side = getattr(draft_model.config, "side_loop_mode", "none")

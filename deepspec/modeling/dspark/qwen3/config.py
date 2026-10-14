@@ -64,6 +64,7 @@ def build_draft_config(
     from deepspec.modeling.dspark.ouro import validate_exit_config
     validate_exit_config(draft_config)
     draft_config.block_size = int(model_args.block_size)
+    draft_config.sample_from_anchor = bool(model_args.get("sample_from_anchor", True))
     draft_config.tie_word_embeddings = False
     draft_config.layer_types = layer_types
     draft_config._attn_implementation = TRAIN_ATTN_IMPLEMENTATION
