@@ -68,6 +68,9 @@ from the checkpoint and rejects an algorithm/checkpoint mismatch.
 
 ## Timing and implementation
 
+For matched **real inference inputs**, four paths x eager/CUDA Graph, with
+5 warmup and 50 measured draft calls, see [eight-way inference timing](docs/inference_timing.md).
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/side/benchmark.py \
   --draft /path/to/A_or_B/step_latest \

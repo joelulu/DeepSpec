@@ -35,6 +35,14 @@ def forward_dspark_draft_block(
     draft_position_ids = position_ids[
         :, past_key_values_draft.get_seq_length() : start + block_size
     ]
+    # Read-only diagnostic observer. It receives the cache BEFORE this forward
+    # appends context. Normal evaluation has no observer and takes the old path.
+    observer = getattr(model, "draft_timing_observer", None)
+    if observer is not None:
+        observer.observe(model=model, draft_input_ids=draft_input_ids,
+                         position_ids=draft_position_ids,
+                         past_key_values=past_key_values_draft,
+                         target_hidden_states=target_hidden_states, start=start)
     backbone_kwargs = {}
     if isinstance(model, Qwen3DSparkModel):
         backbone_kwargs["side_anchor_token_ids"] = draft_input_ids[:, ::model.block_size]

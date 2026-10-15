@@ -196,8 +196,10 @@ def side_branch(model, prepared, first, collect_logits=False):
 
 
 def run_paths(model, prepared, *, execution="serial", collect_logits=False):
-    if execution not in ("serial", "overlap", "main", "side"):
-        raise ValueError("execution must be serial|overlap|main|side")
+    execution = {"main_only": "main", "side_only": "side",
+                 "dual_stream": "overlap"}.get(execution, execution)
+    if execution not in ("serial", "overlap", "main", "side", "fusion_only"):
+        raise ValueError("execution must be serial|overlap|main|side|fusion_only")
     if execution == "overlap" and (model.training or torch.is_grad_enabled() or prepared["noise"].device.type != "cuda"):
         raise ValueError("overlap requires CUDA eval under no_grad/inference_mode")
     first = shared_first(model, prepared)
@@ -206,24 +208,29 @@ def run_paths(model, prepared, *, execution="serial", collect_logits=False):
     if execution == "side":
         side, aux = side_branch(model, prepared, first, collect_logits)
         return model.norm(side), aux
-    if execution == "overlap":
-        current = torch.cuda.current_stream(first.device)
-        if getattr(model, "_side_stream", None) is None:
-            model._side_stream = torch.cuda.Stream(device=first.device)
-        stream = model._side_stream
-        stream.wait_stream(current)
-        for tensor in (first, prepared["noise"], prepared["context"], prepared["position_ids"],
-                       *prepared["rope"], *(t for pair in prepared["projected"] for t in pair)):
-            tensor.record_stream(stream)
-        if prepared["anchors"] is not None:
-            prepared["anchors"].record_stream(stream)
-        if torch.is_tensor(prepared["attention_mask"]):
-            prepared["attention_mask"].record_stream(stream)
-        with torch.cuda.stream(stream):
-            side, aux = side_branch(model, prepared, first, collect_logits)
-            side.record_stream(current)
+    if execution == "fusion_only":
         main = main_tail(model, prepared, first)
-        current.wait_stream(stream)
+        with prepared["timer"].stage("fusion"):
+            return model.norm(model.side_fusion(main, first)), None
+    if execution == "overlap":
+        with prepared["timer"].stage("fork_join"):
+            current = torch.cuda.current_stream(first.device)
+            if getattr(model, "_side_stream", None) is None:
+                model._side_stream = torch.cuda.Stream(device=first.device)
+            stream = model._side_stream
+            stream.wait_stream(current)
+            for tensor in (first, prepared["noise"], prepared["context"], prepared["position_ids"],
+                           *prepared["rope"], *(t for pair in prepared["projected"] for t in pair)):
+                tensor.record_stream(stream)
+            if prepared["anchors"] is not None:
+                prepared["anchors"].record_stream(stream)
+            if torch.is_tensor(prepared["attention_mask"]):
+                prepared["attention_mask"].record_stream(stream)
+            with torch.cuda.stream(stream):
+                side, aux = side_branch(model, prepared, first, collect_logits)
+                side.record_stream(current)
+            main = main_tail(model, prepared, first)
+            current.wait_stream(stream)
     else:
         main = main_tail(model, prepared, first)
         side, aux = side_branch(model, prepared, first, collect_logits)
