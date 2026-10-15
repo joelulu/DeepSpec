@@ -79,6 +79,15 @@ the original unpadded forward. Each mode checks eager/graph tokens on every
 state. The padded shapes add work, so compare the eight rows with each other,
 not directly against the older synthetic full-context benchmark.
 
+Different GEMM/SDPA shapes can produce sparse BF16 rounding differences even
+with a correct mask. Padded/unpadded hidden validation first applies elementwise
+`rtol=0.02, atol=0.02`. A BF16-only fallback allows at most 0.1% failing elements,
+global relative L2 <= 1%, worst-position relative L2 <= 2%, and maximum absolute
+error <= eight BF16 epsilon units times `max(1, reference RMS)`. Exact greedy
+token equality is still required. These diagnostic bounds do not establish
+quality equivalence. Per-state metrics are saved to `padding_validation.jsonl`,
+including failed validation. Graph/eager checks are unchanged.
+
 Graph setup includes extra uncaptured warmups and capture/replay per shape.
 Those are outside the requested five warmup plus fifty measured observations.
 Only the current shape's graph set is retained, limiting graph memory growth.

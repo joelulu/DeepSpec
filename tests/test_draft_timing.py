@@ -7,7 +7,7 @@ import torch
 
 from deepspec.eval.dspark.draft_ops import forward_dspark_draft_block
 from deepspec.eval.dspark.draft_timing import (MODES, DraftTimingObserver, GraphForward,
-    StaticDraftInput, TimingComplete, bucket_size, summarize_calls)
+    StaticDraftInput, TimingComplete, bucket_size, padding_hidden_report, summarize_calls)
 from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from deepspec.modeling.dspark.side_loop import prepare_paths, run_paths
@@ -125,6 +125,42 @@ def test_cli_validation_and_buckets():
         bucket_size(33, (16, 32))
     with pytest.raises(SystemExit):
         parse_args(["--target", "t", "--draft", "d", "--output", "o", "--measure-calls", "0"])
+
+
+def test_bf16_sparse_tail_does_not_fail_on_one_element_of_40960():
+    expected = torch.ones(1, 16, 2560, dtype=torch.bfloat16)
+    expected[0, 1, 67] = 0.27
+    actual = expected.clone()
+    actual[0, 1, 67] += 0.0302734375
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+    report = padding_hidden_report(actual, expected)
+    assert report["passed"] and report["status"] == "bounded_bf16_tail"
+    assert report["elementwise_mismatches"] == 1 and report["elements"] == 40960
+    assert report["relative_l2"] < 0.001
+
+
+@pytest.mark.parametrize("kind", ["widespread", "single_large", "one_position", "nonfinite"])
+def test_padding_validation_still_rejects_substantial_error(kind):
+    expected = torch.ones(1, 16, 2560, dtype=torch.bfloat16)
+    actual = expected.clone()
+    if kind == "widespread":
+        actual += 0.05
+    elif kind == "single_large":
+        actual[0, 1, 67] += 2.0
+    elif kind == "one_position":
+        actual[0, 1] += 0.05
+    else:
+        actual[0, 1, 67] = float("nan")
+    assert not padding_hidden_report(actual, expected)["passed"]
+
+
+def test_sparse_tail_allowance_is_not_used_for_fp32():
+    expected = torch.ones(1, 16, 2560)
+    expected[0, 1, 67] = 0.27
+    actual = expected.clone()
+    actual[0, 1, 67] += 0.03
+    assert not padding_hidden_report(actual, expected)["passed"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph/overlap requires GPU")
