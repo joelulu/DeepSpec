@@ -20,7 +20,7 @@ from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.modeling.dspark.side_loop import PathTimer, run_paths
 
 
-MODES = ("main_only", "side_only", "dual_stream", "fusion_only")
+MODES = ("main_only", "side_only", "dual_stream", "fusion_only", "serial_dual")
 BACKENDS = ("eager", "cudagraph")
 
 
@@ -46,25 +46,32 @@ def distribution(values):
 
 def summarize_calls(rows):
     summaries = []
-    for mode in MODES:
-        for backend in BACKENDS:
-            selected = [r for r in rows if r["mode"] == mode and r["backend"] == backend]
-            if not selected:
-                continue
-            row = dict(mode=mode, backend=backend, calls=len(selected),
-                       context_min=min(r["context_tokens"] for r in selected),
-                       context_max=max(r["context_tokens"] for r in selected))
-            for metric in ("wall_ms", "gpu_ms", "host_submit_ms", "input_copy_ms"):
-                for stat, value in distribution([r[metric] for r in selected]).items():
-                    row[f"{metric}_{stat}"] = value
-            summaries.append(row)
+    groups = sorted({(r.get("loops", 5), r["mode"], r["backend"]) for r in rows},
+                    key=lambda g: (g[0], MODES.index(g[1]), BACKENDS.index(g[2])))
+    for loops, mode, backend in groups:
+        selected = [r for r in rows if r["mode"] == mode and r["backend"] == backend
+                    and r.get("loops", 5) == loops]
+        row = dict(loops=loops, mode=mode, backend=backend, calls=len(selected),
+                   context_min=min(r["context_tokens"] for r in selected),
+                   context_max=max(r["context_tokens"] for r in selected))
+        for metric in ("wall_ms", "gpu_ms", "host_submit_ms", "input_copy_ms"):
+            for stat, value in distribution([r[metric] for r in selected]).items():
+                row[f"{metric}_{stat}"] = value
+        summaries.append(row)
     for row in summaries:
         base = next((r for r in summaries if r["mode"] == "main_only"
-                    and r["backend"] == row["backend"]), None)
+                    and r["backend"] == row["backend"] and r["loops"] == row["loops"]), None)
         # Preserve the original error if a diagnostic fails partway through a
         # shuffled group list before its main-only baseline has been measured.
         row["extra_wall_ms"] = row["wall_ms_mean"] - base["wall_ms_mean"] if base else None
         row["overhead_wall_pct"] = 100 * row["extra_wall_ms"] / base["wall_ms_mean"] if base else None
+        serial = next((r for r in summaries if r["mode"] == "serial_dual"
+                      and r["backend"] == row["backend"] and r["loops"] == row["loops"]), None)
+        matched = row["mode"] == "dual_stream" and serial is not None
+        row["saved_vs_serial_wall_ms"] = serial["wall_ms_mean"] - row["wall_ms_mean"] if matched else None
+        row["saved_vs_serial_wall_pct"] = (100 * row["saved_vs_serial_wall_ms"]
+                                           / serial["wall_ms_mean"] if matched else None)
+        row["speedup_vs_serial"] = serial["wall_ms_mean"] / row["wall_ms_mean"] if matched else None
     return summaries
 
 
@@ -72,7 +79,7 @@ def validate_timing_model(model):
     if len(model.layers) != 5 or model.num_loops != 1:
         raise ValueError("Timing requires five main layers and one main-stack pass")
     if model.side_loop_mode != "fusion" or model.side_fusion is None:
-        raise ValueError("Use the trained A/fusion checkpoint for all eight groups")
+        raise ValueError("Use the trained A/fusion checkpoint for all timing groups")
     if model.markov_head is not None or model.confidence_head is not None:
         raise ValueError("This benchmark supports plain DFlash, without Markov/confidence heads")
     if model.sample_from_anchor or model.block_size != 16:
@@ -131,7 +138,7 @@ class StaticDraftInput:
                 key.copy_(old_key)
                 value.copy_(old_value)
 
-    def forward(self, mode, timer=None):
+    def forward(self, mode, timer=None, *, side_loops=None):
         if mode not in MODES:
             raise ValueError(f"Unknown timing mode {mode}")
         model = self.model
@@ -154,7 +161,7 @@ class StaticDraftInput:
             prepared = dict(context=context, rope=rope, projected=projected,
                 position_ids=self.positions, attention_mask=None, noise=noise,
                 anchors=self.ids[:, :1], layer_kwargs={"is_causal": False}, timer=timer)
-        hidden, _ = run_paths(model, prepared, execution=mode)
+        hidden, _ = run_paths(model, prepared, execution=mode, side_loop_steps=side_loops)
         with timer.stage("output_head"):
             logits = model.compute_logits(hidden[:, 1:])
         with timer.stage("proposal_heads"):
@@ -165,21 +172,21 @@ class StaticDraftInput:
 
 
 class GraphForward:
-    def __init__(self, snapshot, mode, warmup=3):
-        self.snapshot, self.mode = snapshot, mode
+    def __init__(self, snapshot, mode, warmup=3, *, side_loops=None):
+        self.snapshot, self.mode, self.side_loops = snapshot, mode, side_loops
         device = snapshot.device
         stream = torch.cuda.Stream(device=device)
         current = torch.cuda.current_stream(device)
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
             for _ in range(warmup):
-                snapshot.forward(mode)
+                snapshot.forward(mode, side_loops=side_loops)
         current.wait_stream(stream)
         torch.cuda.synchronize(device)
         self.graph = torch.cuda.CUDAGraph()
         # run_paths forks from this capture stream and rejoins before returning.
         with torch.cuda.graph(self.graph, stream=stream):
-            self.output = snapshot.forward(mode)
+            self.output = snapshot.forward(mode, side_loops=side_loops)
         self.graph.replay()
         torch.cuda.synchronize(device)
 
@@ -206,7 +213,7 @@ def measure_forward(fn, device):
 class DraftTimingObserver:
     def __init__(self, model, output, *, warmup_calls=5, measure_calls=50,
                  buckets=(1024, 4096), modes=MODES, backends=BACKENDS,
-                 seed=42, profile_trace=False, component_timings=True):
+                 seed=42, profile_trace=False, component_timings=True, loop_counts=None):
         validate_timing_model(model)
         if warmup_calls < 1 or measure_calls < 1:
             raise ValueError("warmup-calls and measure-calls must be positive")
@@ -218,6 +225,10 @@ class DraftTimingObserver:
             raise ValueError("Invalid or duplicate backends")
         if "main_only" not in modes:
             raise ValueError("Include main_only as the matched baseline")
+        loop_counts = tuple(loop_counts) if loop_counts is not None else (model.side_loop_steps,)
+        if (not loop_counts or min(loop_counts) < 1
+                or tuple(sorted(set(loop_counts))) != loop_counts):
+            raise ValueError("Loop counts must be positive, unique and increasing")
         self.model, self.output = model, Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         # A fresh directory prevents mixing records from different invocations.
@@ -225,6 +236,7 @@ class DraftTimingObserver:
             raise ValueError("Output already contains timing results; choose a new --output")
         self.warmup_calls, self.measure_calls = warmup_calls, measure_calls
         self.buckets, self.modes, self.backends = tuple(buckets), tuple(modes), tuple(backends)
+        self.loop_counts = loop_counts
         self.profile_trace, self.component_timings = profile_trace, component_timings
         self.rng = random.Random(seed)
         self.seen, self.rows, self.setup_rows, self.components = 0, [], [], []
@@ -236,7 +248,7 @@ class DraftTimingObserver:
         model._side_stream = torch.cuda.Stream(device=self.device)
         self.metadata = dict(status="running", warmup_calls=warmup_calls,
             measure_calls=measure_calls, modes=self.modes, backends=self.backends,
-            context_buckets=self.buckets, side_loop_steps=model.side_loop_steps,
+            context_buckets=self.buckets, side_loop_steps=model.side_loop_steps, loop_counts=loop_counts,
             batch=1, block_size=model.block_size, seed=seed,
             device=torch.cuda.get_device_name(self.device), torch_version=torch.__version__,
             reference="main_only eager on original unpadded context cache",
@@ -248,6 +260,8 @@ class DraftTimingObserver:
                          "setup excluded from measured forward latency",
             validation="original elementwise hidden tolerance and exact greedy tokens; "
                        "metrics in input_validation.jsonl",
+            loop_semantics="total Layer1 calls including shared first call; main/fusion-only "
+                           "baselines repeated per loop count on the same reference states",
             note="host_submit_ms includes Python and driver dispatch, not pure CPU compute; "
                  "GPU span can include dispatch stalls; profiler/components are separate calls")
         self.flush()
@@ -287,23 +301,36 @@ class DraftTimingObserver:
         copy_ms = (time.perf_counter() - copy_begin) * 1000
         # Exact-shape graph capture/validation are always outside measurements.
         if changed:
-            for mode in self.modes:
-                expected_hidden, expected_ids = self.snapshot.forward(mode)
-                torch.cuda.synchronize(self.device)
-                if "cudagraph" in self.backends:
-                    try:
-                        graph = GraphForward(self.snapshot, mode)
-                    except Exception as exc:
-                        raise RuntimeError(f"CUDA Graph capture failed for {mode}, exact_shape={key}; "
-                            "no eager fallback was substituted. Try --backends eager to diagnose.") from exc
-                    hidden, ids = graph()
+            checked_loops = []
+            for loops in self.loop_counts:
+                expected_outputs = {}
+                for mode in self.modes:
+                    expected_hidden, expected_ids = self.snapshot.forward(mode, side_loops=loops)
                     torch.cuda.synchronize(self.device)
-                    torch.testing.assert_close(hidden, expected_hidden, rtol=2e-2, atol=2e-2)
-                    if not torch.equal(ids, expected_ids):
-                        raise RuntimeError(f"Eager/Graph token mismatch for {mode}")
-                    self.graphs[mode] = graph
+                    expected_outputs[mode] = (expected_hidden, expected_ids)
+                    if "cudagraph" in self.backends:
+                        try:
+                            graph = GraphForward(self.snapshot, mode, side_loops=loops)
+                        except Exception as exc:
+                            raise RuntimeError(f"CUDA Graph capture failed for {mode}, loops={loops}, "
+                                f"exact_shape={key}; no eager fallback was substituted. "
+                                "Try --backends eager to diagnose.") from exc
+                        hidden, ids = graph()
+                        torch.cuda.synchronize(self.device)
+                        torch.testing.assert_close(hidden, expected_hidden, rtol=2e-2, atol=2e-2)
+                        if not torch.equal(ids, expected_ids):
+                            raise RuntimeError(f"Eager/Graph token mismatch for {mode}, loops={loops}")
+                        self.graphs[(loops, mode)] = graph
+                if "serial_dual" in self.modes and "dual_stream" in self.modes:
+                    serial_hidden, serial_ids = expected_outputs["serial_dual"]
+                    dual_hidden, dual_ids = expected_outputs["dual_stream"]
+                    torch.testing.assert_close(dual_hidden, serial_hidden, rtol=2e-2, atol=2e-2)
+                    if not torch.equal(serial_ids, dual_ids):
+                        raise RuntimeError(f"Serial/dual token mismatch, loops={loops}, exact_shape={key}")
+                    checked_loops.append(loops)
             self.setup_rows.append(dict(call=self.seen + 1, cached_tokens=key[0],
-                new_context_tokens=key[1], setup_ms=(time.perf_counter() - setup_begin) * 1000))
+                new_context_tokens=key[1], serial_dual_validated_loops=checked_loops,
+                setup_ms=(time.perf_counter() - setup_begin) * 1000))
         # Check an exact-shape snapshot against the original incremental path.
         # Only main_only is used to advance the reference decode trajectory.
         from deepspec.modeling.dspark.side_loop import prepare_paths
@@ -333,25 +360,36 @@ class DraftTimingObserver:
                 f.write(json.dumps(report) + "\n")
         self.seen += 1
         warmup = self.seen <= self.warmup_calls
-        groups = [(mode, backend) for mode in self.modes for backend in self.backends]
+        groups = [(loops, mode, backend) for loops in self.loop_counts
+                  for mode in self.modes for backend in self.backends]
         self.rng.shuffle(groups)
         outputs = {}
-        for mode, backend in groups:
-            fn = self.graphs[mode] if backend == "cudagraph" else lambda m=mode: self.snapshot.forward(m)
+        for loops, mode, backend in groups:
+            fn = (self.graphs[(loops, mode)] if backend == "cudagraph"
+                  else lambda m=mode, n=loops: self.snapshot.forward(m, side_loops=n))
             timing, (_, ids) = measure_forward(fn, self.device)
-            outputs[(mode, backend)] = ids.clone()
+            outputs[(loops, mode, backend)] = ids.clone()
             if not warmup:
                 row = dict(call=self.seen - self.warmup_calls, reference_call=self.seen,
-                    mode=mode, backend=backend, context_tokens=start, cached_tokens=old,
+                    loops=loops, mode=mode, backend=backend, context_tokens=start, cached_tokens=old,
                     new_context_tokens=new, input_layout="exact",
                     input_copy_ms=copy_ms, **timing)
                 self.rows.append(row)
                 with (self.output / "calls.jsonl").open("a") as f:
                     f.write(json.dumps(row) + "\n")
         if "eager" in self.backends and "cudagraph" in self.backends:
-            for mode in self.modes:
-                if not torch.equal(outputs[(mode, "eager")], outputs[(mode, "cudagraph")]):
-                    raise RuntimeError(f"Eager/Graph token mismatch at call {self.seen}, mode={mode}")
+            for loops in self.loop_counts:
+                for mode in self.modes:
+                    if not torch.equal(outputs[(loops, mode, "eager")], outputs[(loops, mode, "cudagraph")]):
+                        raise RuntimeError(f"Eager/Graph token mismatch at call {self.seen}, "
+                                           f"mode={mode}, loops={loops}")
+        if "serial_dual" in self.modes and "dual_stream" in self.modes:
+            for loops in self.loop_counts:
+                for backend in self.backends:
+                    if not torch.equal(outputs[(loops, "serial_dual", backend)],
+                                       outputs[(loops, "dual_stream", backend)]):
+                        raise RuntimeError(f"Serial/dual token mismatch at call {self.seen}, "
+                                           f"backend={backend}, loops={loops}")
         # Exact shapes usually change every round. Capture diagnostic traces
         # only once per context range, not 50 sets of traces/components.
         if not warmup and diagnostic_bucket not in self.diagnosed_keys:
@@ -364,25 +402,27 @@ class DraftTimingObserver:
             raise TimingComplete()
 
     def _diagnose(self, key):
-        if self.component_timings:
-            for mode in self.modes:
-                timer = PathTimer(True, self.device)
-                self.snapshot.forward(mode, timer)
-                torch.cuda.synchronize(self.device)
-                self.components.append(dict(reference_call=self.seen, mode=mode,
-                    cached_tokens=key[0], new_context_tokens=key[1], backend="eager_instrumented",
-                    **timer.resolve()))
-        if self.profile_trace and "dual_stream" in self.modes:
-            for backend in self.backends:
-                fn = (self.graphs["dual_stream"] if backend == "cudagraph"
-                      else lambda: self.snapshot.forward("dual_stream"))
-                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                     torch.profiler.ProfilerActivity.CUDA], record_shapes=True) as profile:
-                    with torch.profiler.record_function(f"dual_stream/{backend}"):
-                        fn()
+        for loops in self.loop_counts:
+            if self.component_timings:
+                for mode in self.modes:
+                    timer = PathTimer(True, self.device)
+                    self.snapshot.forward(mode, timer, side_loops=loops)
                     torch.cuda.synchronize(self.device)
-                profile.export_chrome_trace(str(self.output /
-                    f"dual_stream_{backend}_cached{key[0]}_new{key[1]}.trace.json"))
+                    self.components.append(dict(reference_call=self.seen, loops=loops, mode=mode,
+                        cached_tokens=key[0], new_context_tokens=key[1], backend="eager_instrumented",
+                        **timer.resolve()))
+            if self.profile_trace:
+                for mode in (m for m in self.modes if m in ("dual_stream", "serial_dual")):
+                    for backend in self.backends:
+                        fn = (self.graphs[(loops, mode)] if backend == "cudagraph"
+                              else lambda m=mode, n=loops: self.snapshot.forward(m, side_loops=n))
+                        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                             torch.profiler.ProfilerActivity.CUDA], record_shapes=True) as profile:
+                            with torch.profiler.record_function(f"{mode}/{backend}/loops{loops}"):
+                                fn()
+                            torch.cuda.synchronize(self.device)
+                        profile.export_chrome_trace(str(self.output /
+                            f"{mode}_{backend}_loops{loops}_cached{key[0]}_new{key[1]}.trace.json"))
 
     def flush(self, *, status=None):
         if status is not None:

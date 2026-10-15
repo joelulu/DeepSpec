@@ -135,13 +135,18 @@ def main_tail(model, prepared, first):
         return hidden
 
 
-def side_branch(model, prepared, first, collect_logits=False):
+def side_branch(model, prepared, first, collect_logits=False, side_loop_steps=None):
     with prepared["timer"].stage("side_after_fork"):
         hidden = first
         if model.side_loop_mode == "fusion":
-            for _ in range(1, model.side_loop_steps):
+            steps = model.side_loop_steps if side_loop_steps is None else side_loop_steps
+            if steps < 1:
+                raise ValueError("side_loop_steps must include at least the shared first Layer1")
+            for _ in range(1, steps):
                 hidden = apply_layer(model, prepared, 0, hidden)
             return hidden, None
+        if side_loop_steps is not None:
+            raise ValueError("Loop-count overrides are only supported for fusion timing")
 
         batch, length, width = hidden.shape
         blocks = length // model.block_size
@@ -195,9 +200,9 @@ def side_branch(model, prepared, first, collect_logits=False):
         return side.reshape(batch, length, width), aux_logits
 
 
-def run_paths(model, prepared, *, execution="serial", collect_logits=False):
+def run_paths(model, prepared, *, execution="serial", collect_logits=False, side_loop_steps=None):
     execution = {"main_only": "main", "side_only": "side",
-                 "dual_stream": "overlap"}.get(execution, execution)
+                 "dual_stream": "overlap", "serial_dual": "serial"}.get(execution, execution)
     if execution not in ("serial", "overlap", "main", "side", "fusion_only"):
         raise ValueError("execution must be serial|overlap|main|side|fusion_only")
     if execution == "overlap" and (model.training or torch.is_grad_enabled() or prepared["noise"].device.type != "cuda"):
@@ -206,7 +211,7 @@ def run_paths(model, prepared, *, execution="serial", collect_logits=False):
     if execution == "main":
         return model.norm(main_tail(model, prepared, first)), None
     if execution == "side":
-        side, aux = side_branch(model, prepared, first, collect_logits)
+        side, aux = side_branch(model, prepared, first, collect_logits, side_loop_steps)
         return model.norm(side), aux
     if execution == "fusion_only":
         main = main_tail(model, prepared, first)
@@ -227,13 +232,13 @@ def run_paths(model, prepared, *, execution="serial", collect_logits=False):
             if torch.is_tensor(prepared["attention_mask"]):
                 prepared["attention_mask"].record_stream(stream)
             with torch.cuda.stream(stream):
-                side, aux = side_branch(model, prepared, first, collect_logits)
+                side, aux = side_branch(model, prepared, first, collect_logits, side_loop_steps)
                 side.record_stream(current)
             main = main_tail(model, prepared, first)
             current.wait_stream(stream)
     else:
         main = main_tail(model, prepared, first)
-        side, aux = side_branch(model, prepared, first, collect_logits)
+        side, aux = side_branch(model, prepared, first, collect_logits, side_loop_steps)
     with prepared["timer"].stage("fusion"):
         output = model.norm(model.side_fusion(main, side))
     return output, aux

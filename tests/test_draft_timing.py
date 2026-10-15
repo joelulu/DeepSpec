@@ -1,4 +1,4 @@
-"""Verify matched snapshots, cache isolation and the eight-way timing protocol."""
+"""Verify matched snapshots, cache isolation and the loop-sweep timing protocol."""
 import json
 from types import SimpleNamespace
 
@@ -28,7 +28,7 @@ def model_and_ids(device="cpu"):
     return model, ids
 
 
-@pytest.mark.parametrize("mode", ["main_only", "side_only", "fusion_only"])
+@pytest.mark.parametrize("mode", ["main_only", "side_only", "fusion_only", "serial_dual"])
 def test_exact_snapshot_matches_original_forward_and_preserves_cache(mode):
     model, ids = model_and_ids()
     cache = ContextKVCache()
@@ -48,7 +48,8 @@ def test_exact_snapshot_matches_original_forward_and_preserves_cache(mode):
             actual, tokens = snapshot.forward(mode)
             for hook in hooks:
                 hook.remove()
-            assert calls == ([5, 0, 0, 0, 0] if mode == "side_only" else [1, 1, 1, 1, 1])
+            assert calls == ([5, 0, 0, 0, 0] if mode == "side_only"
+                             else [5, 1, 1, 1, 1] if mode == "serial_dual" else [1, 1, 1, 1, 1])
             assert cache.get_seq_length() == old
             for i in before:
                 for a, b in zip(before[i], cache.layers[i]):
@@ -107,7 +108,7 @@ def test_summary_divides_by_actual_calls_and_compares_matching_backend():
                 rows.append(dict(mode=mode, backend=backend, context_tokens=8,
                     wall_ms=value, gpu_ms=value - 0.1, host_submit_ms=0.2, input_copy_ms=0.3))
     summaries = summarize_calls(rows)
-    assert len(summaries) == 8
+    assert len(summaries) == 10
     eager = next(r for r in summaries if r["mode"] == "dual_stream" and r["backend"] == "eager")
     graph = next(r for r in summaries if r["mode"] == "dual_stream" and r["backend"] == "cudagraph")
     assert eager["calls"] == 2 and eager["wall_ms_mean"] == 5.5
@@ -118,7 +119,8 @@ def test_summary_divides_by_actual_calls_and_compares_matching_backend():
 def test_cli_validation_and_buckets():
     args = parse_args(["--target", "target", "--draft", "draft", "--output", "out"])
     assert args.warmup_calls == 5 and args.measure_calls == 50
-    assert len(args.modes) * len(args.backends) == 8
+    assert len(args.modes) * len(args.backends) == 10
+    assert args.loop_counts == (5,)
     assert bucket_size(0, (16, 32)) == 0
     assert bucket_size(17, (16, 32)) == 32
     with pytest.raises(ValueError, match="never truncated"):
@@ -142,6 +144,70 @@ def test_changed_context_shape_requires_new_snapshot():
     with torch.inference_mode(), pytest.raises(ValueError, match="recapture"):
         snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(1, 7, 64),
             past_key_values=cache, position_ids=torch.arange(23).unsqueeze(0), start=7)
+
+
+@pytest.mark.parametrize("loops", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("mode", ["main_only", "side_only", "fusion_only", "serial_dual"])
+def test_loop_override_counts_shared_l1_once_and_preserves_model(mode, loops):
+    model, ids = model_and_ids()
+    snapshot = StaticDraftInput(model, 0, 6)
+    with torch.inference_mode():
+        snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(1, 6, 64),
+            past_key_values=ContextKVCache(), position_ids=torch.arange(22).unsqueeze(0), start=6)
+        calls = [0] * 5
+        hooks = []
+        for i, layer in enumerate(model.layers):
+            def count(module, args, output, index=i):
+                calls[index] += 1
+            hooks.append(layer.register_forward_hook(count))
+        actual, tokens = snapshot.forward(mode, side_loops=loops)
+        for hook in hooks:
+            hook.remove()
+        expected = ([loops, 0, 0, 0, 0] if mode == "side_only" else
+                    [loops, 1, 1, 1, 1] if mode == "serial_dual" else [1, 1, 1, 1, 1])
+        assert calls == expected
+        assert model.side_loop_steps == 5
+        if loops == 1 and mode == "serial_dual":
+            fusion, fusion_tokens = snapshot.forward("fusion_only")
+            torch.testing.assert_close(actual, fusion, atol=0, rtol=0)
+            assert torch.equal(tokens, fusion_tokens)
+        # An override must not leak into the next group or reference model.
+        default, _ = snapshot.forward(mode)
+        explicit, _ = snapshot.forward(mode, side_loops=5)
+        torch.testing.assert_close(default, explicit, atol=0, rtol=0)
+
+
+def test_sweep_summary_keeps_loops_and_backends_separate_and_reports_serial_saving():
+    rows = []
+    for loops in (1, 5):
+        for backend, base in (("eager", 4.0), ("cudagraph", 2.0)):
+            for mode, value in (("main_only", base), ("serial_dual", base + loops),
+                                ("dual_stream", base + loops / 2)):
+                rows.append(dict(loops=loops, mode=mode, backend=backend, context_tokens=100,
+                    wall_ms=value, gpu_ms=value, host_submit_ms=0.1, input_copy_ms=0.2))
+    summary = summarize_calls(rows)
+    assert len(summary) == 12
+    for row in summary:
+        if row["mode"] == "dual_stream":
+            base = 4.0 if row["backend"] == "eager" else 2.0
+            loops = row["loops"]
+            assert row["overhead_wall_pct"] == pytest.approx(100 * (loops / 2) / base)
+            assert row["saved_vs_serial_wall_ms"] == loops / 2
+            assert row["saved_vs_serial_wall_pct"] == pytest.approx(100 * (loops / 2) / (base + loops))
+            assert row["speedup_vs_serial"] == pytest.approx((base + loops) / (base + loops / 2))
+        else:
+            assert row["saved_vs_serial_wall_ms"] is None
+
+
+def test_cli_loop_sweep_overrides_single_count_and_accepts_serial():
+    base = ["--target", "t", "--draft", "d", "--output", "o"]
+    args = parse_args(base + ["--loop-sweep", "1,2,3,4,5", "--backends", "cudagraph"])
+    assert args.loop_counts == (1, 2, 3, 4, 5)
+    assert "serial_dual" in args.modes
+    assert len(args.loop_counts) * len(args.modes) * len(args.backends) == 25
+    for invalid in ("", "0,1", "1,1", "2,1", "x", "1,"):
+        with pytest.raises(SystemExit):
+            parse_args(base + ["--loop-sweep", invalid])
 
 
 @pytest.mark.parametrize("new", [1, 2, 5, 6])
@@ -175,7 +241,8 @@ def test_bf16_exact_snapshot_keeps_original_projection_shapes(new):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph/overlap requires GPU")
 @pytest.mark.parametrize("mode", MODES)
-def test_cuda_exact_graph_replays_updated_inputs_and_matches_eager(mode):
+@pytest.mark.parametrize("loops", [1, 3, 5])
+def test_cuda_exact_graph_replays_updated_inputs_and_matches_eager(mode, loops):
     model, ids = model_and_ids("cuda")
     model = model.to(dtype=torch.bfloat16)
     model._side_stream = torch.cuda.Stream()
@@ -189,14 +256,14 @@ def test_cuda_exact_graph_replays_updated_inputs_and_matches_eager(mode):
         positions = torch.arange(6, 24, device="cuda").unsqueeze(0)
         snapshot.update(draft_input_ids=ids, target_hidden_states=features,
             past_key_values=cache, position_ids=positions, start=8)
-        graph = GraphForward(snapshot, mode)
+        graph = GraphForward(snapshot, mode, side_loops=loops)
         for iteration in range(2):
             new = 2
             ids[:, 0] = 3 + iteration
             snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(
                 1, new, 64, device="cuda", dtype=torch.bfloat16), past_key_values=cache,
                 position_ids=positions, start=6 + new)
-            expected, expected_ids = snapshot.forward(mode)
+            expected, expected_ids = snapshot.forward(mode, side_loops=loops)
             actual, actual_ids = graph()
             torch.cuda.synchronize()
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
@@ -208,7 +275,7 @@ def test_cuda_observer_excludes_warmup_stops_at_budget_and_keeps_reference_cache
     model, ids = model_and_ids("cuda")
     model = model.to(dtype=torch.bfloat16)
     observer = DraftTimingObserver(model, tmp_path, warmup_calls=1, measure_calls=2,
-        buckets=(16, 32), component_timings=False)
+        buckets=(16, 32), component_timings=False, loop_counts=(1, 3, 5))
     cache = ContextKVCache()
     with torch.inference_mode():
         kwargs = dict(model=model, draft_input_ids=ids,
@@ -233,6 +300,10 @@ def test_cuda_observer_excludes_warmup_stops_at_budget_and_keeps_reference_cache
             torch.testing.assert_close(a, b, atol=0, rtol=0)
     assert len(observer.setup_rows) == 3
     summary = observer.flush(status="complete")
-    assert len(summary) == 8 and all(r["calls"] == 2 for r in summary)
-    assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 16
+    assert len(summary) == 30 and all(r["calls"] == 2 for r in summary)
+    records = [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()]
+    assert len(records) == 60
+    assert {r["reference_call"] for r in records} == {2, 3}
+    for setup in observer.setup_rows:
+        assert setup["serial_dual_validated_loops"] == [1, 3, 5]
     assert json.loads((tmp_path / "metadata.json").read_text())["status"] == "complete"

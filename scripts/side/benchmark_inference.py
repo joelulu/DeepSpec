@@ -1,4 +1,4 @@
-"""Time eight matched draft forwards inside real, single-request decoding."""
+"""Time matched draft paths and loop sweeps inside real single-request decoding."""
 from __future__ import annotations
 
 import argparse
@@ -23,11 +23,13 @@ def parse_args(argv=None):
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--side-loops", type=int, default=5)
+    parser.add_argument("--loop-sweep", default=None,
+        help="Comma-separated total Layer1 counts, e.g. 1,2,3,4,5; overrides --side-loops")
     parser.add_argument("--warmup-calls", type=int, default=5)
     parser.add_argument("--measure-calls", type=int, default=50)
     parser.add_argument("--context-buckets", default="1024,4096",
         help="Compatible context limit/trace ranges; timing uses exact shapes without padding")
-    parser.add_argument("--modes", default="main_only,side_only,dual_stream,fusion_only")
+    parser.add_argument("--modes", default="main_only,side_only,dual_stream,fusion_only,serial_dual")
     parser.add_argument("--backends", default="eager,cudagraph")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--profile-trace", action="store_true")
@@ -40,6 +42,14 @@ def parse_args(argv=None):
     if args.block_size != 16:
         parser.error("This experiment fixes block-size=16")
     try:
+        args.loop_counts = (tuple(int(x) for x in args.loop_sweep.split(","))
+                            if args.loop_sweep is not None else (args.side_loops,))
+    except ValueError:
+        parser.error("loop-sweep must be comma-separated integers")
+    if (not args.loop_counts or min(args.loop_counts) < 1
+            or tuple(sorted(set(args.loop_counts))) != args.loop_counts):
+        parser.error("loop-sweep counts must be positive, unique and increasing")
+    try:
         args.buckets = tuple(int(x) for x in args.context_buckets.split(","))
     except ValueError:
         parser.error("context-buckets must be comma-separated integers")
@@ -47,7 +57,7 @@ def parse_args(argv=None):
         parser.error("context-buckets must be positive, unique and increasing")
     args.modes = tuple(args.modes.split(","))
     args.backends = tuple(args.backends.split(","))
-    valid_modes = {"main_only", "side_only", "dual_stream", "fusion_only"}
+    valid_modes = {"main_only", "side_only", "dual_stream", "fusion_only", "serial_dual"}
     if (not args.modes or set(args.modes) - valid_modes or "main_only" not in args.modes
             or len(set(args.modes)) != len(args.modes)):
         parser.error("Choose unique timing modes and include main_only")
@@ -90,7 +100,7 @@ def run(args):
         warmup_calls=args.warmup_calls, measure_calls=args.measure_calls,
         buckets=args.buckets, modes=args.modes, backends=args.backends,
         seed=args.seed, profile_trace=args.profile_trace,
-        component_timings=not args.no_component_timings)
+        component_timings=not args.no_component_timings, loop_counts=args.loop_counts)
     try:
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     except (OSError, subprocess.CalledProcessError):
@@ -143,11 +153,13 @@ def run(args):
     finally:
         draft.draft_timing_observer = None
     summaries = observer.flush(status="complete")
-    print("\nmode          backend     calls   wall_ms/call   GPU_ms/call   overhead")
+    print("\nloops mode          backend     calls   wall_ms/call   GPU_ms/call   overhead  saved_vs_serial")
     for row in summaries:
-        print(f"{row['mode']:13s} {row['backend']:10s} {row['calls']:5d} "
+        saved = row['saved_vs_serial_wall_pct']
+        saved_text = f"{saved:+.2f}%" if saved is not None else "-"
+        print(f"{row['loops']:5d} {row['mode']:13s} {row['backend']:10s} {row['calls']:5d} "
               f"{row['wall_ms_mean']:14.4f} {row['gpu_ms_mean']:13.4f} "
-              f"{row['overhead_wall_pct']:+9.2f}%")
+              f"{row['overhead_wall_pct']:+9.2f}% {saved_text:>15s}")
     print(f"\nResults: {args.output / 'summary.csv'}", flush=True)
 
 

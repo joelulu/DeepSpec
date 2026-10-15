@@ -1,4 +1,4 @@
-# Eight-way draft inference timing
+# Matched draft inference timing and loop sweeps
 
 This diagnostic uses a **trained A/fusion plain DFlash checkpoint** for all
 groups. It does not train, save weights, or compare generation quality.
@@ -9,15 +9,16 @@ groups. It does not train, save weights, or compare generation quality.
 | B | `side_only` | Layer1 called five times | norm, head, greedy token selection |
 | C | `dual_stream` | first Layer1 shared, remaining four calls on each branch | fusion, norm, head, greedy token selection |
 | D | `fusion_only` | Layer1 to Layer5, preserve H1 | fusion of H5 and H1, norm, head, greedy selection |
+| E | `serial_dual` | first Layer1 shared; main tail then side tail on one stream | same fusion, norm, head, greedy selection as C |
 
 These group letters do not rename the earlier training variants. Each mode
-runs with both `eager` and `cudagraph`, for eight groups. B has no intermediate
+runs with both `eager` and `cudagraph`, for ten groups by default. B has no intermediate
 head or token feedback. `--side-loops 5` includes the first Layer1 call.
 
 ## Run
 
 Activate the existing DeepSpec environment. Expose exactly one GPU. A quick
-smoke checks the same eight groups with one warmup and two measured calls:
+smoke checks the same ten groups with one warmup and two measured calls:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
@@ -40,8 +41,51 @@ python scripts/side/benchmark_inference.py \
   --warmup-calls 5 --measure-calls 50 \
   --context-buckets 1024,4096 \
   --profile-trace \
-  --output runs/inference_timing_8groups
+  --output runs/inference_timing_10groups
 ```
+
+## CUDA Graph loop sweep and serial control
+
+Run both new tests together on one matched set of reference inputs:
+
+```bash
+python scripts/side/benchmark_inference.py \
+  --target /home/jovyan/LMM/lmm_model/Qwen3-4B \
+  --draft "$DRAFT" --task gsm8k \
+  --block-size 16 --loop-sweep 1,2,3,4,5 \
+  --modes main_only,side_only,dual_stream,fusion_only,serial_dual \
+  --backends cudagraph \
+  --warmup-calls 5 --measure-calls 50 \
+  --context-buckets 1024,4096 --profile-trace \
+  --output runs/inference_timing_graph_loop_sweep
+```
+
+This produces **25 rows**, each with 50 measured calls after five warmup states.
+All loop counts and modes see the same 50 states in one reference decode;
+measurement order is shuffled across all groups. `--loop-sweep` overrides
+`--side-loops`. Loops count total Layer1 evaluations, including the first shared
+call: loops=1 means zero extra Layer1 calls, loops=5 means four extra calls.
+Main-only and fusion-only ignore the loop count; their baselines are measured
+again for each count to expose variation rather than reusing one timing number.
+The model's loop configuration is never changed between groups.
+
+E executes the exact same physical layers, context projections, fusion and
+output heads as C, sharing the first L1 only once. E finishes main L2–5, then
+executes the side L1 repeats on the same stream. C forks the two tails onto two
+streams. Both use the same requested backend. Serial/dual hidden states and
+exact greedy tokens are checked during setup; greedy tokens are also checked
+on every timed state. The setup record lists validated loop counts.
+
+Compare dual-stream `overhead_wall_pct` with zero to assess how much additional
+latency remains relative to main-only. Small differences require checking
+median/P90 and repeatability. Compare `saved_vs_serial_wall_pct` to assess the
+benefit of parallel scheduling for **equal work**: positive means C is faster
+than E; negative means C is slower. This is distinct from overhead versus A.
+At loops=1, E and D have identical math; C still exercises stream fork/join.
+
+Use `--backends eager,cudagraph` for all 50 groups if an eager comparison is
+also needed. To reproduce the original eight groups, select
+`--modes main_only,side_only,dual_stream,fusion_only` with one loop count.
 
 Use a new output directory on each invocation; existing results are never
 silently appended or overwritten. If graph capture fails, the command fails
@@ -93,19 +137,22 @@ Only the current shape's graph set is retained, limiting graph memory growth.
 
 ## Results
 
-- `summary.csv`: mode/backend, actual calls, context range, mean/median/P90 of
-  wall and GPU time, dispatch time, and overhead against **the same backend's**
-  main-only baseline.
-- `calls.jsonl`: each measured forward, matched reference-call ID and exact context sizes, wall/GPU/host-submit time, and separately measured snapshot
+- `summary.csv`: loops/mode/backend, actual calls, context range, mean/median/P90
+  of wall and GPU time, dispatch time, and overhead against the main-only
+  baseline with **the same loops and backend**. Dual-stream rows also include
+  `saved_vs_serial_wall_ms`, `saved_vs_serial_wall_pct`, and `speedup_vs_serial`.
+  Saving is serial minus dual; percent saving divides by serial latency.
+- `calls.jsonl`: each measured forward, loop count, matched reference-call ID and exact context sizes, wall/GPU/host-submit time, and separately measured snapshot
   copy time. One shared input copy time is repeated across rows for that state;
-  do not sum it eight times as actual harness work.
+  do not sum it once per group as actual harness work.
 - `metadata.json`: completion/error status, model/target/git revision, hardware,
   call budgets, scope, and graph setup costs. Check `status=complete`.
 - `components.json`: separate instrumented eager calls, including shared L1,
   main tail, side tail, fork/join span, fusion and head. Overlapping branch
   times cannot be summed to obtain total time.
-- `dual_stream_*.trace.json` with `--profile-trace`: separate CPU/CUDA traces
-  for eager and graph on the first measured state in each configured context range.
+- `dual_stream_*_loops*.trace.json` and `serial_dual_*_loops*.trace.json` with
+  `--profile-trace`: separate CPU/CUDA traces for each selected loop count and
+  backend on the first measured state in each configured context range.
   Open in a compatible trace viewer to inspect actual kernel overlap.
 
 `host_submit_ms` includes Python/driver dispatch through end-event recording;
@@ -123,6 +170,7 @@ python -m pytest -q tests/test_draft_timing.py tests/test_side_loop.py
 ```
 
 CPU checks cover cache isolation, exact-shape incremental equivalence in FP32/BF16,
-layer counts, H1 fusion, stop-hook behavior, CLI validation and averaging.
-Five added CUDA cases exercise graph replay with updated inputs and the exact
-warmup/measurement budget. They are skipped on hosts without a CUDA GPU.
+layer counts for loops 1–5, H1 fusion, loop override isolation, stop-hook
+behavior, CLI validation, grouping and serial-saving calculations.
+CUDA cases exercise graph replay with updated inputs at loops 1/3/5, serial
+equivalence, matched loop-sweep states and the exact warmup/measurement budget. They are skipped on hosts without a CUDA GPU.
