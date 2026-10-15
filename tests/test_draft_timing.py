@@ -7,7 +7,7 @@ import torch
 
 from deepspec.eval.dspark.draft_ops import forward_dspark_draft_block
 from deepspec.eval.dspark.draft_timing import (MODES, DraftTimingObserver, GraphForward,
-    StaticDraftInput, TimingComplete, bucket_size, padding_hidden_report, summarize_calls)
+    StaticDraftInput, TimingComplete, bucket_size, summarize_calls)
 from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
 from deepspec.modeling.dspark.side_loop import prepare_paths, run_paths
@@ -29,14 +29,14 @@ def model_and_ids(device="cpu"):
 
 
 @pytest.mark.parametrize("mode", ["main_only", "side_only", "fusion_only"])
-def test_padded_incremental_snapshot_matches_unpadded_forward_and_preserves_cache(mode):
+def test_exact_snapshot_matches_original_forward_and_preserves_cache(mode):
     model, ids = model_and_ids()
     cache = ContextKVCache()
     with torch.inference_mode():
         for old, new in ((0, 6), (6, 2), (8, 1)):
             features = torch.randn(1, new, 64)
             positions = torch.arange(old, old + new + 16).unsqueeze(0)
-            snapshot = StaticDraftInput(model, 0 if old == 0 else 16, 16)
+            snapshot = StaticDraftInput(model, old, new)
             snapshot.update(draft_input_ids=ids, target_hidden_states=features,
                 past_key_values=cache, position_ids=positions, start=old + new)
             before = {i: tuple(t.clone() for t in pair) for i, pair in cache.layers.items()}
@@ -127,61 +127,75 @@ def test_cli_validation_and_buckets():
         parse_args(["--target", "t", "--draft", "d", "--output", "o", "--measure-calls", "0"])
 
 
-def test_bf16_sparse_tail_does_not_fail_on_one_element_of_40960():
-    expected = torch.ones(1, 16, 2560, dtype=torch.bfloat16)
-    expected[0, 1, 67] = 0.27
-    actual = expected.clone()
-    actual[0, 1, 67] += 0.0302734375
-    with pytest.raises(AssertionError):
-        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-    report = padding_hidden_report(actual, expected)
-    assert report["passed"] and report["status"] == "bounded_bf16_tail"
-    assert report["elementwise_mismatches"] == 1 and report["elements"] == 40960
-    assert report["relative_l2"] < 0.001
+def test_partial_summary_does_not_hide_failure_when_baseline_is_not_yet_measured():
+    row = dict(mode="dual_stream", backend="eager", context_tokens=96,
+               wall_ms=4.0, gpu_ms=3.9, host_submit_ms=0.3, input_copy_ms=0.1)
+    summary = summarize_calls([row])
+    assert summary[0]["calls"] == 1
+    assert summary[0]["overhead_wall_pct"] is None
 
 
-@pytest.mark.parametrize("kind", ["widespread", "single_large", "one_position", "nonfinite"])
-def test_padding_validation_still_rejects_substantial_error(kind):
-    expected = torch.ones(1, 16, 2560, dtype=torch.bfloat16)
-    actual = expected.clone()
-    if kind == "widespread":
-        actual += 0.05
-    elif kind == "single_large":
-        actual[0, 1, 67] += 2.0
-    elif kind == "one_position":
-        actual[0, 1] += 0.05
-    else:
-        actual[0, 1, 67] = float("nan")
-    assert not padding_hidden_report(actual, expected)["passed"]
+def test_changed_context_shape_requires_new_snapshot():
+    model, ids = model_and_ids()
+    cache = ContextKVCache()
+    snapshot = StaticDraftInput(model, 0, 6)
+    with torch.inference_mode(), pytest.raises(ValueError, match="recapture"):
+        snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(1, 7, 64),
+            past_key_values=cache, position_ids=torch.arange(23).unsqueeze(0), start=7)
 
 
-def test_sparse_tail_allowance_is_not_used_for_fp32():
-    expected = torch.ones(1, 16, 2560)
-    expected[0, 1, 67] = 0.27
-    actual = expected.clone()
-    actual[0, 1, 67] += 0.03
-    assert not padding_hidden_report(actual, expected)["passed"]
+@pytest.mark.parametrize("new", [1, 2, 5, 6])
+def test_bf16_exact_snapshot_keeps_original_projection_shapes(new):
+    model, ids = model_and_ids()
+    model = model.to(dtype=torch.bfloat16)
+    cache = ContextKVCache()
+    with torch.inference_mode():
+        prefix = torch.randn(1, 6, 64, dtype=torch.bfloat16)
+        prepare_paths(model, position_ids=torch.arange(22).unsqueeze(0),
+            noise_embedding=model.embed_tokens(ids), target_hidden_states=prefix,
+            past_key_values=cache, is_causal=False)
+        features = torch.randn(1, new, 64, dtype=torch.bfloat16)
+        positions = torch.arange(6, 6 + new + 16).unsqueeze(0)
+        snapshot = StaticDraftInput(model, 6, new)
+        snapshot.update(draft_input_ids=ids, target_hidden_states=features,
+            past_key_values=cache, position_ids=positions, start=6 + new)
+        shapes = []
+        hook = model.fc.register_forward_pre_hook(lambda module, args: shapes.append(args[0].shape))
+        actual, _ = snapshot.forward("main_only")
+        isolated = ContextKVCache()
+        isolated.layers = dict(cache.layers)
+        prepared = prepare_paths(model, position_ids=positions,
+            noise_embedding=model.embed_tokens(ids), target_hidden_states=features,
+            past_key_values=isolated, is_causal=False)
+        expected, _ = run_paths(model, prepared, execution="main_only")
+        hook.remove()
+        assert shapes == [torch.Size([1, new, 64])] * 2
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph/overlap requires GPU")
 @pytest.mark.parametrize("mode", MODES)
-def test_cuda_graph_replays_new_real_inputs_and_matches_eager(mode):
+def test_cuda_exact_graph_replays_updated_inputs_and_matches_eager(mode):
     model, ids = model_and_ids("cuda")
     model = model.to(dtype=torch.bfloat16)
     model._side_stream = torch.cuda.Stream()
     cache = ContextKVCache()
-    snapshot = StaticDraftInput(model, 16, 16)
     with torch.inference_mode():
-        features = torch.randn(1, 6, 64, device="cuda", dtype=torch.bfloat16)
-        positions = torch.arange(22, device="cuda").unsqueeze(0)
+        prepare_paths(model, position_ids=torch.arange(22, device="cuda").unsqueeze(0),
+            noise_embedding=model.embed_tokens(ids), target_hidden_states=torch.randn(
+                1, 6, 64, device="cuda", dtype=torch.bfloat16), past_key_values=cache)
+        snapshot = StaticDraftInput(model, 6, 2)
+        features = torch.randn(1, 2, 64, device="cuda", dtype=torch.bfloat16)
+        positions = torch.arange(6, 24, device="cuda").unsqueeze(0)
         snapshot.update(draft_input_ids=ids, target_hidden_states=features,
-            past_key_values=cache, position_ids=positions, start=6)
+            past_key_values=cache, position_ids=positions, start=8)
         graph = GraphForward(snapshot, mode)
-        for new in (6, 9):
-            ids[:, 0] = 3 + new
+        for iteration in range(2):
+            new = 2
+            ids[:, 0] = 3 + iteration
             snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(
                 1, new, 64, device="cuda", dtype=torch.bfloat16), past_key_values=cache,
-                position_ids=torch.arange(new + 16, device="cuda").unsqueeze(0), start=new)
+                position_ids=positions, start=6 + new)
             expected, expected_ids = snapshot.forward(mode)
             actual, actual_ids = graph()
             torch.cuda.synchronize()
@@ -200,12 +214,24 @@ def test_cuda_observer_excludes_warmup_stops_at_budget_and_keeps_reference_cache
         kwargs = dict(model=model, draft_input_ids=ids,
             target_hidden_states=torch.randn(1, 6, 64, device="cuda", dtype=torch.bfloat16),
             past_key_values=cache, position_ids=torch.arange(22, device="cuda").unsqueeze(0), start=6)
-        observer.observe(**kwargs)
-        assert not observer.rows
-        observer.observe(**kwargs)
+        for old, new in ((0, 6), (6, 2)):
+            kwargs.update(target_hidden_states=torch.randn(1, new, 64, device="cuda", dtype=torch.bfloat16),
+                position_ids=torch.arange(old, old + new + 16, device="cuda").unsqueeze(0), start=old + new)
+            observer.observe(**kwargs)
+            if old == 0:
+                assert not observer.rows
+            prepare_paths(model, position_ids=kwargs["position_ids"], noise_embedding=model.embed_tokens(ids),
+                target_hidden_states=kwargs["target_hidden_states"], past_key_values=cache)
+        before = {i: tuple(t.clone() for t in pair) for i, pair in cache.layers.items()}
+        kwargs.update(target_hidden_states=torch.randn(1, 2, 64, device="cuda", dtype=torch.bfloat16),
+            position_ids=torch.arange(8, 26, device="cuda").unsqueeze(0), start=10)
         with pytest.raises(TimingComplete):
             observer.observe(**kwargs)
-    assert cache.layers == {}
+    assert cache.get_seq_length() == 8
+    for i in before:
+        for a, b in zip(before[i], cache.layers[i]):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+    assert len(observer.setup_rows) == 3
     summary = observer.flush(status="complete")
     assert len(summary) == 8 and all(r["calls"] == 2 for r in summary)
     assert len((tmp_path / "calls.jsonl").read_text().splitlines()) == 16

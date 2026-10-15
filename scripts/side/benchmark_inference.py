@@ -25,7 +25,8 @@ def parse_args(argv=None):
     parser.add_argument("--side-loops", type=int, default=5)
     parser.add_argument("--warmup-calls", type=int, default=5)
     parser.add_argument("--measure-calls", type=int, default=50)
-    parser.add_argument("--context-buckets", default="1024,4096")
+    parser.add_argument("--context-buckets", default="1024,4096",
+        help="Compatible context limit/trace ranges; timing uses exact shapes without padding")
     parser.add_argument("--modes", default="main_only,side_only,dual_stream,fusion_only")
     parser.add_argument("--backends", default="eager,cudagraph")
     parser.add_argument("--seed", type=int, default=42)

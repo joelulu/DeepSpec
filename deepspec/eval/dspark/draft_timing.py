@@ -1,7 +1,7 @@
 """Matched-input forward timing on states from real speculative decoding.
 
-Only plain Qwen3 DFlash fusion checkpoints are supported. Graphs use padded,
-masked projected-context inputs and fixed buffers. No diagnostic forward writes
+Only plain Qwen3 DFlash fusion checkpoints are supported. Graphs use exact-shape
+projected-context inputs and fixed buffers, recaptured when shapes change. No diagnostic forward writes
 to the reference cache. This is per-call latency, not serving throughput.
 """
 from __future__ import annotations
@@ -26,46 +26,6 @@ BACKENDS = ("eager", "cudagraph")
 
 class TimingComplete(Exception):
     """Stop reference generation as soon as the matched call budget is met."""
-
-
-def padding_hidden_report(actual, expected):
-    """Validate different-shape BF16 forwards without a single-element veto.
-
-    Padding changes GEMM/SDPA shapes and reduction order. Keep the original
-    elementwise test as the first criterion, but allow a sparse, bounded BF16
-    tail only when global and per-position relative L2 remain small. This is
-    ONLY for padded versus unpadded inputs; graph/eager checks stay unchanged.
-    Greedy token equality is checked separately by the caller.
-    """
-    if actual.shape != expected.shape or actual.dtype != expected.dtype:
-        raise ValueError("Padded/unpadded hidden shape or dtype differs")
-    a, b = actual.float(), expected.float()
-    if not bool((torch.isfinite(a).all() & torch.isfinite(b).all()).item()):
-        return dict(passed=False, status="nonfinite", dtype=str(actual.dtype))
-    delta = a - b
-    absolute = delta.abs()
-    mismatch = absolute > (0.02 + 0.02 * b.abs())
-    count = int(mismatch.sum().item())
-    relative_l2 = float((delta.norm() / b.norm().clamp_min(1e-12)).item())
-    position_relative_l2 = float((delta.norm(dim=-1) /
-                                 b.norm(dim=-1).clamp_min(1e-12)).max().item())
-    reference_rms = float(b.square().mean().sqrt().item())
-    max_abs = float(absolute.max().item())
-    # Eight BF16 epsilon units at the reference RMS scale, with a unit floor
-    # appropriate for these final RMS-normalized hidden states.
-    max_abs_limit = 8 * torch.finfo(torch.bfloat16).eps * max(1.0, reference_rms)
-    fraction = count / actual.numel()
-    bounded_tail = (actual.dtype == torch.bfloat16 and fraction <= 0.001
-                    and relative_l2 <= 0.01 and position_relative_l2 <= 0.02
-                    and max_abs <= max_abs_limit)
-    passed = count == 0 or bounded_tail
-    return dict(passed=passed, status=("elementwise_close" if count == 0 else
-        "bounded_bf16_tail" if bounded_tail else "excessive_error"),
-        dtype=str(actual.dtype), elements=actual.numel(), elementwise_mismatches=count,
-        mismatch_fraction=fraction, relative_l2=relative_l2,
-        max_position_relative_l2=position_relative_l2, reference_rms=reference_rms,
-        max_abs=max_abs, limits=dict(mismatch_fraction=0.001, relative_l2=0.01,
-            max_position_relative_l2=0.02, max_abs=max_abs_limit))
 
 
 def bucket_size(length, buckets):
@@ -99,10 +59,12 @@ def summarize_calls(rows):
                     row[f"{metric}_{stat}"] = value
             summaries.append(row)
     for row in summaries:
-        base = next(r for r in summaries if r["mode"] == "main_only"
-                    and r["backend"] == row["backend"])
-        row["extra_wall_ms"] = row["wall_ms_mean"] - base["wall_ms_mean"]
-        row["overhead_wall_pct"] = 100 * row["extra_wall_ms"] / base["wall_ms_mean"]
+        base = next((r for r in summaries if r["mode"] == "main_only"
+                    and r["backend"] == row["backend"]), None)
+        # Preserve the original error if a diagnostic fails partway through a
+        # shuffled group list before its main-only baseline has been measured.
+        row["extra_wall_ms"] = row["wall_ms_mean"] - base["wall_ms_mean"] if base else None
+        row["overhead_wall_pct"] = 100 * row["extra_wall_ms"] / base["wall_ms_mean"] if base else None
     return summaries
 
 
@@ -120,12 +82,13 @@ def validate_timing_model(model):
 
 
 class StaticDraftInput:
-    """Fixed-address, read-only snapshot of an incremental draft input.
+    """Fixed-address snapshot with exactly the reference forward's shapes.
 
-    Old KV and newly projected KV are concatenated with separate padding masks.
-    This avoids dynamic indexing/scattering inside graph capture. Both backends
-    run exactly this layout. Input copies are outside forward timing and reported
-    separately; new-feature projection and cache concatenation are inside it.
+    No padding or extra attention mask is introduced. A different (old, new)
+    context length needs a new snapshot and graph capture. Input copies are
+    outside forward timing and reported separately; projection of new features
+    and cache concatenation are measured. Diagnostic calls never mutate the
+    reference cache.
     """
     def __init__(self, model, old_capacity, new_capacity):
         self.model = model
@@ -134,21 +97,16 @@ class StaticDraftInput:
         device, dtype = weight.device, weight.dtype
         self.device = device
         self.ids = torch.empty((1, model.block_size), device=device, dtype=torch.long)
-        self.features = torch.zeros((1, new_capacity,
+        self.features = torch.empty((1, new_capacity,
             len(model.target_layer_ids) * model.config.hidden_size), device=device, dtype=dtype)
-        self.positions = torch.zeros((1, new_capacity + model.block_size),
+        self.positions = torch.empty((1, new_capacity + model.block_size),
                                      device=device, dtype=torch.long)
-        self.old_length = torch.zeros((), device=device, dtype=torch.long)
-        self.new_length = torch.zeros((), device=device, dtype=torch.long)
-        self.old_indices = torch.arange(old_capacity, device=device)
-        self.new_indices = torch.arange(new_capacity, device=device)
-        self.block_valid = torch.ones(model.block_size, device=device, dtype=torch.bool)
         self.old_kv = []
         for layer in model.layers:
             attn = layer.self_attn
             shape = (1, attn.num_key_value_heads, old_capacity, attn.head_dim)
-            self.old_kv.append((torch.zeros(shape, device=device, dtype=dtype),
-                                torch.zeros(shape, device=device, dtype=dtype)))
+            self.old_kv.append((torch.empty(shape, device=device, dtype=dtype),
+                                torch.empty(shape, device=device, dtype=dtype)))
 
     def update(self, *, draft_input_ids, target_hidden_states, past_key_values,
                position_ids, start):
@@ -156,27 +114,22 @@ class StaticDraftInput:
         new = target_hidden_states.shape[1]
         if old + new != start:
             raise ValueError(f"Context alignment: cached={old}, new={new}, anchor={start}")
-        if old > self.old_capacity or new > self.new_capacity:
-            raise ValueError("Snapshot capacity exceeded")
-        if draft_input_ids.shape != self.ids.shape or position_ids.shape[1] != new + self.model.block_size:
+        if (old, new) != (self.old_capacity, self.new_capacity):
+            raise ValueError("Exact-shape snapshot requires recapture for changed context lengths")
+        if draft_input_ids.shape != self.ids.shape or position_ids.shape != self.positions.shape:
             raise ValueError("Expected one complete draft block and aligned position IDs")
         self.ids.copy_(draft_input_ids)
-        self.features.zero_()
-        self.features[:, :new].copy_(target_hidden_states)
-        self.positions[:, :self.new_capacity].copy_(
-            (old + self.new_indices).unsqueeze(0))
-        self.positions[:, self.new_capacity:].copy_(position_ids[:, -self.model.block_size:])
-        self.old_length.fill_(old)
-        self.new_length.fill_(new)
+        self.features.copy_(target_hidden_states)
+        self.positions.copy_(position_ids)
         for index, (key, value) in enumerate(self.old_kv):
             if old:
                 if index not in past_key_values.layers:
                     raise ValueError(f"Missing reference context KV at layer {index}")
                 old_key, old_value = past_key_values.layers[index]
-                if old_key.shape[-2] != old or old_value.shape[-2] != old:
-                    raise ValueError("Reference cache layers have unequal lengths")
-                key[..., :old, :].copy_(old_key)
-                value[..., :old, :].copy_(old_value)
+                if old_key.shape != key.shape or old_value.shape != value.shape:
+                    raise ValueError("Reference cache layers have unequal shapes")
+                key.copy_(old_key)
+                value.copy_(old_value)
 
     def forward(self, mode, timer=None):
         if mode not in MODES:
@@ -187,18 +140,19 @@ class StaticDraftInput:
             noise = model.embed_tokens(self.ids)
             context = model.hidden_norm(model.fc(self.features))
             rope = model.rotary_emb(noise, self.positions)
-            valid = torch.cat((self.old_indices < self.old_length,
-                               self.new_indices < self.new_length, self.block_valid))
-            mask = valid[None, None, None, :]
             projected = [None] * 5
             needed = (0,) if mode == "side_only" else range(5)
             for index in needed:
                 key, value = model.layers[index].self_attn.project_context(context, rope)
-                old_key, old_value = self.old_kv[index]
-                projected[index] = (torch.cat((old_key, key), dim=-2),
-                                    torch.cat((old_value, value), dim=-2))
+                if self.old_capacity:
+                    old_key, old_value = self.old_kv[index]
+                    key = torch.cat((old_key, key), dim=-2)
+                    value = torch.cat((old_value, value), dim=-2)
+                # Match ContextKVCache.update: no concatenation for an empty
+                # cache. Avoid changing first-call KV layout/strides.
+                projected[index] = key, value
             prepared = dict(context=context, rope=rope, projected=projected,
-                position_ids=self.positions, attention_mask=mask, noise=noise,
+                position_ids=self.positions, attention_mask=None, noise=noise,
                 anchors=self.ids[:, :1], layer_kwargs={"is_causal": False}, timer=timer)
         hidden, _ = run_paths(model, prepared, execution=mode)
         with timer.stage("output_head"):
@@ -289,9 +243,11 @@ class DraftTimingObserver:
             scope="real-input incremental draft forward: embedding, new-context projection, "
                   "cache concatenation, backbone, norm, head and greedy token selection; "
                   "target verification and static-input copies excluded",
-            padding="old and new KV independently bucketed and masked, identical for both backends",
-            padding_validation="elementwise close or sparse bounded BF16 tail, plus exact greedy tokens; "
-                               "per-state metrics in padding_validation.jsonl",
+            input_layout="exact original context/new-feature lengths, no padding or extra mask",
+            graph_policy="recapture all selected modes when (cached_tokens, new_tokens) changes; "
+                         "setup excluded from measured forward latency",
+            validation="original elementwise hidden tolerance and exact greedy tokens; "
+                       "metrics in input_validation.jsonl",
             note="host_submit_ms includes Python and driver dispatch, not pure CPU compute; "
                  "GPU span can include dispatch stalls; profiler/components are separate calls")
         self.flush()
@@ -316,13 +272,11 @@ class DraftTimingObserver:
             raise TimingComplete()
         if model is not self.model or not isinstance(past_key_values, ContextKVCache):
             raise ValueError("Observer requires its own Qwen3 model and ContextKVCache")
-        # Reject oversized prefixes even if old/new pieces individually fit.
-        bucket_size(start, self.buckets)
+        # --context-buckets remains a compatible upper-limit/diagnostic grouping
+        # argument. It no longer changes any tensor shape.
+        diagnostic_bucket = bucket_size(start, self.buckets)
         old, new = past_key_values.get_seq_length(), target_hidden_states.shape[1]
-        # Decode adds at most one block of fresh target features. Do not pad
-        # those 1..16 new tokens to a 1024-token context bucket.
-        new_capacity = max(model.block_size, 1 << (new - 1).bit_length())
-        key = (bucket_size(old, self.buckets), new_capacity)
+        key = (old, new)
         changed = key != self.key
         setup_begin = self._setup(key) if changed else None
         torch.cuda.synchronize(self.device)
@@ -331,7 +285,7 @@ class DraftTimingObserver:
             target_hidden_states=target_hidden_states, past_key_values=past_key_values, start=start)
         torch.cuda.synchronize(self.device)
         copy_ms = (time.perf_counter() - copy_begin) * 1000
-        # Graph capture and per-bucket validation are always outside measurements.
+        # Exact-shape graph capture/validation are always outside measurements.
         if changed:
             for mode in self.modes:
                 expected_hidden, expected_ids = self.snapshot.forward(mode)
@@ -340,7 +294,7 @@ class DraftTimingObserver:
                     try:
                         graph = GraphForward(self.snapshot, mode)
                     except Exception as exc:
-                        raise RuntimeError(f"CUDA Graph capture failed for {mode}, buckets={key}; "
+                        raise RuntimeError(f"CUDA Graph capture failed for {mode}, exact_shape={key}; "
                             "no eager fallback was substituted. Try --backends eager to diagnose.") from exc
                     hidden, ids = graph()
                     torch.cuda.synchronize(self.device)
@@ -348,9 +302,9 @@ class DraftTimingObserver:
                     if not torch.equal(ids, expected_ids):
                         raise RuntimeError(f"Eager/Graph token mismatch for {mode}")
                     self.graphs[mode] = graph
-            self.setup_rows.append(dict(call=self.seen + 1, old_bucket=key[0],
-                new_bucket=key[1], setup_ms=(time.perf_counter() - setup_begin) * 1000))
-        # Check masked snapshot against original unpadded incremental execution.
+            self.setup_rows.append(dict(call=self.seen + 1, cached_tokens=key[0],
+                new_context_tokens=key[1], setup_ms=(time.perf_counter() - setup_begin) * 1000))
+        # Check an exact-shape snapshot against the original incremental path.
         # Only main_only is used to advance the reference decode trajectory.
         from deepspec.modeling.dspark.side_loop import prepare_paths
         isolated = ContextKVCache()
@@ -361,20 +315,22 @@ class DraftTimingObserver:
         expected, _ = run_paths(model, prepared, execution="main_only")
         actual, actual_tokens = self.snapshot.forward("main_only")
         torch.cuda.synchronize(self.device)
-        report = padding_hidden_report(actual, expected)
-        report.update(reference_call=self.seen + 1, context_tokens=start,
-                      cached_tokens=old, new_context_tokens=new,
-                      old_bucket=key[0], new_bucket=key[1])
-        if report["passed"]:
+        report = dict(reference_call=self.seen + 1, context_tokens=start,
+            cached_tokens=old, new_context_tokens=new, input_layout="exact", passed=False)
+        try:
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
             expected_tokens = model.compute_logits(expected[:, 1:]).argmax(-1)
             report["token_mismatches"] = int((actual_tokens != expected_tokens).sum().item())
-            report["passed"] = report["token_mismatches"] == 0
-            if not report["passed"]:
-                report["status"] = "greedy_token_mismatch"
-        with (self.output / "padding_validation.jsonl").open("a") as f:
-            f.write(json.dumps(report) + "\n")
-        if not report["passed"]:
-            raise RuntimeError("Padded/unpadded forward validation failed: " + json.dumps(report))
+            if report["token_mismatches"]:
+                raise RuntimeError("Exact-shape snapshot changed main-only greedy tokens")
+            report["passed"] = True
+        except (AssertionError, RuntimeError) as exc:
+            report["error"] = str(exc)
+            raise
+        finally:
+            report["max_abs"] = float((actual.float() - expected.float()).abs().max().item())
+            with (self.output / "input_validation.jsonl").open("a") as f:
+                f.write(json.dumps(report) + "\n")
         self.seen += 1
         warmup = self.seen <= self.warmup_calls
         groups = [(mode, backend) for mode in self.modes for backend in self.backends]
@@ -387,7 +343,7 @@ class DraftTimingObserver:
             if not warmup:
                 row = dict(call=self.seen - self.warmup_calls, reference_call=self.seen,
                     mode=mode, backend=backend, context_tokens=start, cached_tokens=old,
-                    new_context_tokens=new, old_bucket=key[0], new_bucket=key[1],
+                    new_context_tokens=new, input_layout="exact",
                     input_copy_ms=copy_ms, **timing)
                 self.rows.append(row)
                 with (self.output / "calls.jsonl").open("a") as f:
@@ -396,9 +352,11 @@ class DraftTimingObserver:
             for mode in self.modes:
                 if not torch.equal(outputs[(mode, "eager")], outputs[(mode, "cudagraph")]):
                     raise RuntimeError(f"Eager/Graph token mismatch at call {self.seen}, mode={mode}")
-        if not warmup and key not in self.diagnosed_keys:
+        # Exact shapes usually change every round. Capture diagnostic traces
+        # only once per context range, not 50 sets of traces/components.
+        if not warmup and diagnostic_bucket not in self.diagnosed_keys:
             self._diagnose(key)
-            self.diagnosed_keys.add(key)
+            self.diagnosed_keys.add(diagnostic_bucket)
         self.flush()
         print(f"draft timing: warmup {min(self.seen, self.warmup_calls)}/{self.warmup_calls}, "
               f"measured {max(0, self.seen-self.warmup_calls)}/{self.measure_calls}, context={start}", flush=True)
@@ -412,7 +370,7 @@ class DraftTimingObserver:
                 self.snapshot.forward(mode, timer)
                 torch.cuda.synchronize(self.device)
                 self.components.append(dict(reference_call=self.seen, mode=mode,
-                    old_bucket=key[0], new_bucket=key[1], backend="eager_instrumented",
+                    cached_tokens=key[0], new_context_tokens=key[1], backend="eager_instrumented",
                     **timer.resolve()))
         if self.profile_trace and "dual_stream" in self.modes:
             for backend in self.backends:
@@ -424,7 +382,7 @@ class DraftTimingObserver:
                         fn()
                     torch.cuda.synchronize(self.device)
                 profile.export_chrome_trace(str(self.output /
-                    f"dual_stream_{backend}_old{key[0]}_new{key[1]}.trace.json"))
+                    f"dual_stream_{backend}_cached{key[0]}_new{key[1]}.trace.json"))
 
     def flush(self, *, status=None):
         if status is not None:

@@ -45,7 +45,7 @@ python scripts/side/benchmark_inference.py \
 
 Use a new output directory on each invocation; existing results are never
 silently appended or overwritten. If graph capture fails, the command fails
-with the mode/bucket and original exception; it never substitutes eager for a
+with the mode/exact shape and original exception; it never substitutes eager for a
 graph row. `--backends eager` is available for diagnosis. Raise the largest
 context bucket if a real prefix is too long. Prefixes are never truncated.
 `--max-samples 128` is only a safety cap, not a request to finish 128 samples.
@@ -70,23 +70,22 @@ graph setup, validation, component diagnostics, and profiler runs are excluded.
 This is not end-to-end generation throughput. B projects only the one physical
 layer it needs; the other modes project all five.
 
-Graphs require stable tensor addresses and shapes. Old projected KV is padded
-to a context bucket. New features use a separate capacity (16 during decode,
-or a power-of-two prefill capacity); old and new padding are independently
-masked. Absolute positions use the actual lengths. Both backends use the same
-layout, and every state checks main-only snapshot hidden/greedy tokens against
-the original unpadded forward. Each mode checks eager/graph tokens on every
-state. The padded shapes add work, so compare the eight rows with each other,
-not directly against the older synthetic full-context benchmark.
+Graphs require stable tensor addresses and shapes. Every snapshot now has
+**exactly the original cached length and new-feature length**. No context or
+feature padding and no extra attention mask are introduced. This preserves the
+GEMM/SDPA shapes and the original first-call KV layout. Whenever the pair of
+lengths changes, the current graph set is released and all selected graph modes
+are recaptured. The diagnostic may therefore take longer to finish. Setup is
+reported separately and is not part of measured forward latency. This measures
+graph replay benefits, not the cost of deploying a graph for every decode step.
 
-Different GEMM/SDPA shapes can produce sparse BF16 rounding differences even
-with a correct mask. Padded/unpadded hidden validation first applies elementwise
-`rtol=0.02, atol=0.02`. A BF16-only fallback allows at most 0.1% failing elements,
-global relative L2 <= 1%, worst-position relative L2 <= 2%, and maximum absolute
-error <= eight BF16 epsilon units times `max(1, reference RMS)`. Exact greedy
-token equality is still required. These diagnostic bounds do not establish
-quality equivalence. Per-state metrics are saved to `padding_validation.jsonl`,
-including failed validation. Graph/eager checks are unchanged.
+The legacy `--context-buckets` argument remains accepted as an upper prefix
+limit and a grouping for profiler/component diagnostics. It does not pad any
+input or affect compute shapes. Every state checks main-only snapshot hidden
+and greedy tokens against the original incremental forward, using the original
+elementwise hidden tolerance (`rtol=0.02, atol=0.02`) and exact token equality.
+There is no BF16 outlier exception. Every mode also checks eager/graph tokens.
+Validation results, including failures, are saved to `input_validation.jsonl`.
 
 Graph setup includes extra uncaptured warmups and capture/replay per shape.
 Those are outside the requested five warmup plus fifty measured observations.
@@ -97,8 +96,7 @@ Only the current shape's graph set is retained, limiting graph memory growth.
 - `summary.csv`: mode/backend, actual calls, context range, mean/median/P90 of
   wall and GPU time, dispatch time, and overhead against **the same backend's**
   main-only baseline.
-- `calls.jsonl`: each measured forward, matched reference-call ID, context and
-  capacity sizes, wall/GPU/host-submit time, and separately measured snapshot
+- `calls.jsonl`: each measured forward, matched reference-call ID and exact context sizes, wall/GPU/host-submit time, and separately measured snapshot
   copy time. One shared input copy time is repeated across rows for that state;
   do not sum it eight times as actual harness work.
 - `metadata.json`: completion/error status, model/target/git revision, hardware,
@@ -107,7 +105,7 @@ Only the current shape's graph set is retained, limiting graph memory growth.
   main tail, side tail, fork/join span, fusion and head. Overlapping branch
   times cannot be summed to obtain total time.
 - `dual_stream_*.trace.json` with `--profile-trace`: separate CPU/CUDA traces
-  for eager and graph on the first measured state of each encountered shape.
+  for eager and graph on the first measured state in each configured context range.
   Open in a compatible trace viewer to inspect actual kernel overlap.
 
 `host_submit_ms` includes Python/driver dispatch through end-event recording;
@@ -124,7 +122,7 @@ change. Interleaved layer submission is a separate follow-up experiment.
 python -m pytest -q tests/test_draft_timing.py tests/test_side_loop.py
 ```
 
-CPU checks cover cache isolation, incremental padded/unpadded equivalence,
+CPU checks cover cache isolation, exact-shape incremental equivalence in FP32/BF16,
 layer counts, H1 fusion, stop-hook behavior, CLI validation and averaging.
 Five added CUDA cases exercise graph replay with updated inputs and the exact
 warmup/measurement budget. They are skipped on hosts without a CUDA GPU.
