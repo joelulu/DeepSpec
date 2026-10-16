@@ -7,7 +7,7 @@ resampled from the fused head; provisional tokens are NOT the final AR prefix.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import math
 
 import torch
@@ -65,6 +65,16 @@ class PathTimer:
         self.enabled = bool(enabled)
         self.device = device
         self.events = {}
+        self.detail_level = "none"
+
+    def begin_forward(self):
+        pass
+
+    def detail_stage(self, name, level="layers"):
+        levels = ("none", "branches", "layers", "modules")
+        if self.enabled and levels.index(self.detail_level) >= levels.index(level):
+            return self.stage(name)
+        return nullcontext()
 
     @contextmanager
     def stage(self, name):
@@ -113,25 +123,31 @@ def prepare_paths(model, *, position_ids, noise_embedding, target_hidden_states,
                 noise=noise_embedding, anchors=side_anchor_token_ids, layer_kwargs=kwargs, timer=timer)
 
 
-def apply_layer(model, prepared, index, hidden):
-    return model.layers[index](
-        hidden_states=hidden, target_hidden_states=prepared["context"],
-        position_embeddings=prepared["rope"], position_ids=prepared["position_ids"],
-        attention_mask=prepared["attention_mask"], past_key_value=None,
-        projected_context_kv=prepared["projected"][index], **prepared["layer_kwargs"],
-    )
+def apply_layer(model, prepared, index, hidden, timing_name=None):
+    timer = prepared["timer"]
+    timing_name = timing_name or f"layer{index + 1}"
+    kwargs = dict(prepared["layer_kwargs"])
+    if timer.detail_level == "modules":
+        kwargs.update(path_timer=timer, timing_prefix=timing_name)
+    with timer.detail_stage(timing_name):
+        return model.layers[index](
+            hidden_states=hidden, target_hidden_states=prepared["context"],
+            position_embeddings=prepared["rope"], position_ids=prepared["position_ids"],
+            attention_mask=prepared["attention_mask"], past_key_value=None,
+            projected_context_kv=prepared["projected"][index], **kwargs,
+        )
 
 
 def shared_first(model, prepared):
     with prepared["timer"].stage("shared_layer1"):
-        return apply_layer(model, prepared, 0, prepared["noise"])
+        return apply_layer(model, prepared, 0, prepared["noise"], "shared_l1")
 
 
 def main_tail(model, prepared, first):
     with prepared["timer"].stage("main_tail"):
         hidden = first
         for index in range(1, 5):
-            hidden = apply_layer(model, prepared, index, hidden)
+            hidden = apply_layer(model, prepared, index, hidden, f"main_l{index + 1}")
         return hidden
 
 
@@ -142,8 +158,8 @@ def side_branch(model, prepared, first, collect_logits=False, side_loop_steps=No
             steps = model.side_loop_steps if side_loop_steps is None else side_loop_steps
             if steps < 1:
                 raise ValueError("side_loop_steps must include at least the shared first Layer1")
-            for _ in range(1, steps):
-                hidden = apply_layer(model, prepared, 0, hidden)
+            for repeat in range(1, steps):
+                hidden = apply_layer(model, prepared, 0, hidden, f"side_repeat{repeat}_l1")
             return hidden, None
         if side_loop_steps is not None:
             raise ValueError("Loop-count overrides are only supported for fusion timing")
@@ -209,14 +225,19 @@ def run_paths(model, prepared, *, execution="serial", collect_logits=False, side
         raise ValueError("overlap requires CUDA eval under no_grad/inference_mode")
     first = shared_first(model, prepared)
     if execution == "main":
-        return model.norm(main_tail(model, prepared, first)), None
+        main = main_tail(model, prepared, first)
+        with prepared["timer"].stage("final_norm"):
+            return model.norm(main), None
     if execution == "side":
         side, aux = side_branch(model, prepared, first, collect_logits, side_loop_steps)
-        return model.norm(side), aux
+        with prepared["timer"].stage("final_norm"):
+            return model.norm(side), aux
     if execution == "fusion_only":
         main = main_tail(model, prepared, first)
         with prepared["timer"].stage("fusion"):
-            return model.norm(model.side_fusion(main, first)), None
+            fused = model.side_fusion(main, first)
+        with prepared["timer"].stage("final_norm"):
+            return model.norm(fused), None
     if execution == "overlap":
         with prepared["timer"].stage("fork_join"):
             current = torch.cuda.current_stream(first.device)
@@ -235,12 +256,15 @@ def run_paths(model, prepared, *, execution="serial", collect_logits=False, side
                 side, aux = side_branch(model, prepared, first, collect_logits, side_loop_steps)
                 side.record_stream(current)
             main = main_tail(model, prepared, first)
-            current.wait_stream(stream)
+            with prepared["timer"].stage("join_wait"):
+                current.wait_stream(stream)
     else:
         main = main_tail(model, prepared, first)
         side, aux = side_branch(model, prepared, first, collect_logits, side_loop_steps)
     with prepared["timer"].stage("fusion"):
-        output = model.norm(model.side_fusion(main, side))
+        fused = model.side_fusion(main, side)
+    with prepared["timer"].stage("final_norm"):
+        output = model.norm(fused)
     return output, aux
 
 

@@ -107,24 +107,33 @@ class Qwen3DSparkAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         projected_context_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        path_timer=None,
+        timing_prefix="layer",
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Optional diagnostic scopes are captured as timing events only by the
+        # benchmark's instrumented graph. Production calls use null contexts.
+        stage = (lambda name: path_timer.detail_stage(f"{timing_prefix}.{name}", "modules")) \
+            if path_timer else (lambda name: nullcontext())
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden_states.shape[1]
-        q = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_attention_heads, self.head_dim
-        )
-        q = self.q_norm(q).transpose(1, 2)
+        with stage("q_projection"):
+            q = self.q_proj(hidden_states).view(
+                bsz, q_len, self.num_attention_heads, self.head_dim
+            )
+            q = self.q_norm(q).transpose(1, 2)
         if projected_context_kv is not None:
-            shape = (bsz, q_len, self.num_key_value_heads, self.head_dim)
-            k_noise = self.k_norm(self.k_proj(hidden_states).view(shape)).transpose(1, 2)
-            v_noise = self.v_proj(hidden_states).view(shape).transpose(1, 2)
-            cos, sin = position_embeddings
-            cos, sin = cos[:, -q_len:].unsqueeze(1), sin[:, -q_len:].unsqueeze(1)
-            q = q * cos + rotate_half(q) * sin
-            k_noise = k_noise * cos + rotate_half(k_noise) * sin
-            k = torch.cat((projected_context_kv[0], k_noise), dim=-2)
-            v = torch.cat((projected_context_kv[1], v_noise), dim=-2)
+            with stage("block_kv_rope"):
+                shape = (bsz, q_len, self.num_key_value_heads, self.head_dim)
+                k_noise = self.k_norm(self.k_proj(hidden_states).view(shape)).transpose(1, 2)
+                v_noise = self.v_proj(hidden_states).view(shape).transpose(1, 2)
+                cos, sin = position_embeddings
+                cos, sin = cos[:, -q_len:].unsqueeze(1), sin[:, -q_len:].unsqueeze(1)
+                q = q * cos + rotate_half(q) * sin
+                k_noise = k_noise * cos + rotate_half(k_noise) * sin
+            with stage("kv_concat"):
+                k = torch.cat((projected_context_kv[0], k_noise), dim=-2)
+                v = torch.cat((projected_context_kv[1], v_noise), dim=-2)
         else:
             k, v = self._legacy_kv(hidden_states, target_hidden_states, bsz, ctx_len, q_len)
             cos, sin = position_embeddings
@@ -132,7 +141,8 @@ class Qwen3DSparkAttention(nn.Module):
         if past_key_values is not None:
             cache_kwargs = {"sin": position_embeddings[1], "cos": position_embeddings[0], "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
-        return self._attend(q, k, v, bsz, q_len, attention_mask, **kwargs)
+        return self._attend(q, k, v, bsz, q_len, attention_mask,
+                            path_timer=path_timer, timing_prefix=timing_prefix, **kwargs)
 
     def _legacy_kv(self, hidden_states, target_hidden_states, bsz, ctx_len, q_len):
         k_ctx = self.k_proj(target_hidden_states)
@@ -149,7 +159,8 @@ class Qwen3DSparkAttention(nn.Module):
         v = v.transpose(1, 2)
         return k, v
 
-    def _attend(self, q, k, v, bsz, q_len, attention_mask, **kwargs):
+    def _attend(self, q, k, v, bsz, q_len, attention_mask,
+                path_timer=None, timing_prefix="layer", **kwargs):
         if (
             self.config._attn_implementation == "flex_attention"
             and self.num_key_value_groups > 1
@@ -167,21 +178,25 @@ class Qwen3DSparkAttention(nn.Module):
         # so keep the per-call value mirrored on the module before invoking it.
         self.is_causal = attn_is_causal
         kwargs["is_causal"] = attn_is_causal
-        attn_output, attn_weights = attn_fn(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
+        stage = (lambda name: path_timer.detail_stage(f"{timing_prefix}.{name}", "modules")) \
+            if path_timer else (lambda name: nullcontext())
+        with stage("attention_kernel"):
+            attn_output, attn_weights = attn_fn(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
         attn_output = attn_output.reshape(
             bsz, q_len, self.num_attention_heads * self.head_dim
         )
-        return self.o_proj(attn_output), attn_weights
+        with stage("o_projection"):
+            return self.o_proj(attn_output), attn_weights
 
 
 class Qwen3DSparkDecoderLayer(GradientCheckpointingLayer):
@@ -210,24 +225,34 @@ class Qwen3DSparkDecoderLayer(GradientCheckpointingLayer):
         ] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        path_timer = kwargs.pop("path_timer", None)
+        timing_prefix = kwargs.pop("timing_prefix", "layer")
+        stage = (lambda name: path_timer.detail_stage(f"{timing_prefix}.{name}", "modules")) \
+            if path_timer else (lambda name: nullcontext())
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            target_hidden_states=target_hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )[0]
+        with stage("input_norm"):
+            hidden_states = self.input_layernorm(hidden_states)
+        with stage("attention"):
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                target_hidden_states=target_hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                path_timer=path_timer,
+                timing_prefix=timing_prefix,
+                **kwargs,
+            )[0]
         hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        with stage("post_attention_norm"):
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        with stage("mlp"):
+            hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
 

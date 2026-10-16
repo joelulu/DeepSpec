@@ -71,6 +71,8 @@ from the checkpoint and rejects an algorithm/checkpoint mismatch.
 For matched **real inference inputs**, five paths (including equal-work serial
 and dual-stream branches) x eager/CUDA Graph, with 5 warmup and 50 measured
 draft calls, see [inference timing and loops 1–5 sweeps](docs/inference_timing.md).
+For loops=2 with only main/dual/side paths and per-module graph timing, see
+[focused stage diagnosis](docs/inference_timing.md#focused-loops2-stage-diagnosis).
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/side/benchmark.py \

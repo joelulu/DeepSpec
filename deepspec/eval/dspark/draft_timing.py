@@ -7,6 +7,7 @@ to the reference cache. This is per-call latency, not serving throughput.
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 import json
 import math
 import random
@@ -22,6 +23,97 @@ from deepspec.modeling.dspark.side_loop import PathTimer, run_paths
 
 MODES = ("main_only", "side_only", "dual_stream", "fusion_only", "serial_dual")
 BACKENDS = ("eager", "cudagraph")
+STAGE_LEVELS = ("none", "branches", "layers", "modules")
+
+
+class ReplayPathTimer(PathTimer):
+    """Reusable external CUDA events, including inside a captured graph.
+
+    Warmups allocate/initialize all events before capture. Replay updates the
+    same event timestamps; resolving never inserts waits between the branches.
+    This intentionally belongs to a separate diagnostic graph because event
+    nodes can perturb scheduling and must not contaminate headline latency.
+    """
+    def __init__(self, device, detail_level="layers"):
+        super().__init__(True, device)
+        if detail_level not in STAGE_LEVELS[1:]:
+            raise ValueError("Choose branches, layers or modules for stage timing")
+        self.detail_level = detail_level
+        self.counts = {}
+
+    def begin_forward(self):
+        self.counts = {}
+
+    @contextmanager
+    def stage(self, name):
+        index = self.counts.get(name, 0)
+        pairs = self.events.setdefault(name, [])
+        if index == len(pairs):
+            pairs.append((torch.cuda.Event(enable_timing=True, external=True),
+                          torch.cuda.Event(enable_timing=True, external=True)))
+        self.counts[name] = index + 1
+        start, end = pairs[index]
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+
+    def timeline(self):
+        """Call only after replay has completed; offsets share the total origin."""
+        origin = self.events["total"][0][0]
+        result = {}
+        for name, count in self.counts.items():
+            pairs = self.events[name][:count]
+            result[name] = dict(ms=sum(a.elapsed_time(b) for a, b in pairs),
+                start_ms=origin.elapsed_time(pairs[0][0]),
+                end_ms=origin.elapsed_time(pairs[-1][1]))
+        return result
+
+
+def branch_metrics(timeline):
+    """Elapsed branch spans, not the intersection of active GPU kernels."""
+    if not {"fork_join", "main_tail", "side_after_fork"} <= timeline.keys():
+        return {}
+    fork, main, side = (timeline[name] for name in ("fork_join", "main_tail", "side_after_fork"))
+    return dict(
+        main_start_after_fork_ms=main["start_ms"] - fork["start_ms"],
+        side_start_after_fork_ms=side["start_ms"] - fork["start_ms"],
+        side_late_ms=max(0.0, side["end_ms"] - main["end_ms"]),
+        main_late_ms=max(0.0, main["end_ms"] - side["end_ms"]),
+        branch_span_overlap_ms=max(0.0, min(main["end_ms"], side["end_ms"])
+                                    - max(main["start_ms"], side["start_ms"])))
+
+
+def summarize_stages(rows):
+    summaries = []
+    groups = sorted({(r["loops"], r["mode"], r["backend"]) for r in rows})
+    for loops, mode, backend in groups:
+        selected = [r for r in rows if (r["loops"], r["mode"], r["backend"]) == (loops, mode, backend)]
+        for stage in sorted({name for r in selected for name in r["stage_ms"]}):
+            values = [r["stage_ms"][stage] for r in selected if stage in r["stage_ms"]]
+            summaries.append(dict(loops=loops, mode=mode, backend=backend,
+                stage=stage, calls=len(values), **{f"ms_{k}": v for k, v in distribution(values).items()}))
+    return summaries
+
+
+def compare_stages(summaries):
+    """Match each dual-stream stage to the same-input single-path control."""
+    result = []
+    for row in summaries:
+        if row["mode"] != "dual_stream":
+            continue
+        stage = row["stage"]
+        control = "side_only" if stage.startswith("side_") else "main_only"
+        base = next((r for r in summaries if r["mode"] == control and r["stage"] == stage
+                     and r["loops"] == row["loops"] and r["backend"] == row["backend"]), None)
+        if base:
+            delta = row["ms_mean"] - base["ms_mean"]
+            result.append(dict(loops=row["loops"], backend=row["backend"], stage=stage,
+                control=control, calls=row["calls"], control_ms=base["ms_mean"],
+                dual_ms=row["ms_mean"], delta_ms=delta,
+                delta_pct=100 * delta / base["ms_mean"] if base["ms_mean"] else None))
+    return result
 
 
 class TimingComplete(Exception):
@@ -143,18 +235,30 @@ class StaticDraftInput:
             raise ValueError(f"Unknown timing mode {mode}")
         model = self.model
         timer = timer or PathTimer(False, self.device)
+        timer.begin_forward()
+        with timer.stage("total"):
+            return self._forward(mode, timer, side_loops=side_loops)
+
+    def _forward(self, mode, timer, *, side_loops):
+        model = self.model
         with timer.stage("prepare"):
-            noise = model.embed_tokens(self.ids)
-            context = model.hidden_norm(model.fc(self.features))
-            rope = model.rotary_emb(noise, self.positions)
+            with timer.detail_stage("embedding"):
+                noise = model.embed_tokens(self.ids)
+            with timer.detail_stage("context_projection"):
+                context = model.hidden_norm(model.fc(self.features))
+            with timer.detail_stage("rope"):
+                rope = model.rotary_emb(noise, self.positions)
             projected = [None] * 5
             needed = (0,) if mode == "side_only" else range(5)
             for index in needed:
-                key, value = model.layers[index].self_attn.project_context(context, rope)
-                if self.old_capacity:
-                    old_key, old_value = self.old_kv[index]
-                    key = torch.cat((old_key, key), dim=-2)
-                    value = torch.cat((old_value, value), dim=-2)
+                with timer.detail_stage(f"context_kv_l{index + 1}"):
+                    with timer.detail_stage(f"context_kv_l{index + 1}.project", "modules"):
+                        key, value = model.layers[index].self_attn.project_context(context, rope)
+                    if self.old_capacity:
+                        with timer.detail_stage(f"context_kv_l{index + 1}.append", "modules"):
+                            old_key, old_value = self.old_kv[index]
+                            key = torch.cat((old_key, key), dim=-2)
+                            value = torch.cat((old_value, value), dim=-2)
                 # Match ContextKVCache.update: no concatenation for an empty
                 # cache. Avoid changing first-call KV layout/strides.
                 projected[index] = key, value
@@ -172,7 +276,7 @@ class StaticDraftInput:
 
 
 class GraphForward:
-    def __init__(self, snapshot, mode, warmup=3, *, side_loops=None):
+    def __init__(self, snapshot, mode, warmup=3, *, side_loops=None, timer=None):
         self.snapshot, self.mode, self.side_loops = snapshot, mode, side_loops
         device = snapshot.device
         stream = torch.cuda.Stream(device=device)
@@ -180,13 +284,13 @@ class GraphForward:
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
             for _ in range(warmup):
-                snapshot.forward(mode, side_loops=side_loops)
+                snapshot.forward(mode, timer, side_loops=side_loops)
         current.wait_stream(stream)
         torch.cuda.synchronize(device)
         self.graph = torch.cuda.CUDAGraph()
         # run_paths forks from this capture stream and rejoins before returning.
         with torch.cuda.graph(self.graph, stream=stream):
-            self.output = snapshot.forward(mode, side_loops=side_loops)
+            self.output = snapshot.forward(mode, timer, side_loops=side_loops)
         self.graph.replay()
         torch.cuda.synchronize(device)
 
@@ -213,7 +317,8 @@ def measure_forward(fn, device):
 class DraftTimingObserver:
     def __init__(self, model, output, *, warmup_calls=5, measure_calls=50,
                  buckets=(1024, 4096), modes=MODES, backends=BACKENDS,
-                 seed=42, profile_trace=False, component_timings=True, loop_counts=None):
+                 seed=42, profile_trace=False, component_timings=True, loop_counts=None,
+                 stage_timings="none"):
         validate_timing_model(model)
         if warmup_calls < 1 or measure_calls < 1:
             raise ValueError("warmup-calls and measure-calls must be positive")
@@ -225,6 +330,8 @@ class DraftTimingObserver:
             raise ValueError("Invalid or duplicate backends")
         if "main_only" not in modes:
             raise ValueError("Include main_only as the matched baseline")
+        if stage_timings not in STAGE_LEVELS:
+            raise ValueError("stage-timings must be none, branches, layers or modules")
         loop_counts = tuple(loop_counts) if loop_counts is not None else (model.side_loop_steps,)
         if (not loop_counts or min(loop_counts) < 1
                 or tuple(sorted(set(loop_counts))) != loop_counts):
@@ -237,10 +344,12 @@ class DraftTimingObserver:
         self.warmup_calls, self.measure_calls = warmup_calls, measure_calls
         self.buckets, self.modes, self.backends = tuple(buckets), tuple(modes), tuple(backends)
         self.loop_counts = loop_counts
+        self.stage_timings = stage_timings
         self.profile_trace, self.component_timings = profile_trace, component_timings
         self.rng = random.Random(seed)
         self.seen, self.rows, self.setup_rows, self.components = 0, [], [], []
         self.key, self.snapshot, self.graphs = None, None, {}
+        self.stage_graphs, self.stage_timers, self.stage_rows = {}, {}, []
         self.diagnosed_keys = set()
         self.device = model.embed_tokens.weight.device
         if self.device.type != "cuda":
@@ -262,6 +371,10 @@ class DraftTimingObserver:
                        "metrics in input_validation.jsonl",
             loop_semantics="total Layer1 calls including shared first call; main/fusion-only "
                            "baselines repeated per loop count on the same reference states",
+            stage_timings=stage_timings,
+            stage_scope="separate instrumented replay on every matched state, external timing "
+                        "events; no synchronization within either branch; nested/overlapping "
+                        "stages must not be summed; event nodes may perturb scheduling",
             note="host_submit_ms includes Python and driver dispatch, not pure CPU compute; "
                  "GPU span can include dispatch stalls; profiler/components are separate calls")
         self.flush()
@@ -271,6 +384,8 @@ class DraftTimingObserver:
         return self.seen >= self.warmup_calls + self.measure_calls
 
     def _setup(self, key):
+        self.stage_graphs.clear()
+        self.stage_timers.clear()
         self.graphs.clear()
         self.snapshot = None
         torch.cuda.synchronize(self.device)
@@ -321,6 +436,25 @@ class DraftTimingObserver:
                         if not torch.equal(ids, expected_ids):
                             raise RuntimeError(f"Eager/Graph token mismatch for {mode}, loops={loops}")
                         self.graphs[(loops, mode)] = graph
+                    if self.stage_timings != "none":
+                        timer = ReplayPathTimer(self.device, self.stage_timings)
+                        self.stage_timers[(loops, mode)] = timer
+                        if "cudagraph" in self.backends:
+                            try:
+                                diagnostic = GraphForward(self.snapshot, mode,
+                                    side_loops=loops, timer=timer)
+                            except Exception as exc:
+                                raise RuntimeError(f"Stage graph capture failed for {mode}, loops={loops}, "
+                                                   f"exact_shape={key}") from exc
+                            self.stage_graphs[(loops, mode)] = diagnostic
+                            diagnostic_hidden, diagnostic_ids = diagnostic()
+                        else:
+                            diagnostic_hidden, diagnostic_ids = self.snapshot.forward(
+                                mode, timer, side_loops=loops)
+                        torch.cuda.synchronize(self.device)
+                        torch.testing.assert_close(diagnostic_hidden, expected_hidden, rtol=2e-2, atol=2e-2)
+                        if not torch.equal(diagnostic_ids, expected_ids):
+                            raise RuntimeError(f"Instrumented token mismatch for {mode}, loops={loops}")
                 if "serial_dual" in self.modes and "dual_stream" in self.modes:
                     serial_hidden, serial_ids = expected_outputs["serial_dual"]
                     dual_hidden, dual_ids = expected_outputs["dual_stream"]
@@ -377,6 +511,27 @@ class DraftTimingObserver:
                 self.rows.append(row)
                 with (self.output / "calls.jsonl").open("a") as f:
                     f.write(json.dumps(row) + "\n")
+            if self.stage_timings != "none":
+                timer = self.stage_timers[(loops, mode)]
+                diagnostic_fn = (self.stage_graphs[(loops, mode)] if backend == "cudagraph"
+                    else lambda m=mode, n=loops, t=timer: self.snapshot.forward(m, t, side_loops=n))
+                diagnostic_timing, (_, diagnostic_ids) = measure_forward(diagnostic_fn, self.device)
+                if not torch.equal(diagnostic_ids, outputs[(loops, mode, backend)]):
+                    raise RuntimeError(f"Instrumented token mismatch at call {self.seen}, "
+                                       f"mode={mode}, loops={loops}")
+                if not warmup:
+                    timeline = timer.timeline()
+                    values = {name: item["ms"] for name, item in timeline.items()}
+                    values.update(branch_metrics(timeline))
+                    values.update(uninstrumented_gpu=timing["gpu_ms"],
+                        instrumented_gpu=diagnostic_timing["gpu_ms"],
+                        instrumentation_extra_gpu=diagnostic_timing["gpu_ms"] - timing["gpu_ms"])
+                    self.stage_rows.append(dict(call=self.seen - self.warmup_calls,
+                        reference_call=self.seen, loops=loops, mode=mode, backend=backend,
+                        context_tokens=start, cached_tokens=old, new_context_tokens=new,
+                        detail_level=self.stage_timings, stage_ms=values, timeline=timeline))
+                    with (self.output / "stage_calls.jsonl").open("a") as f:
+                        f.write(json.dumps(self.stage_rows[-1]) + "\n")
         if "eager" in self.backends and "cudagraph" in self.backends:
             for loops in self.loop_counts:
                 for mode in self.modes:
@@ -412,7 +567,8 @@ class DraftTimingObserver:
                         cached_tokens=key[0], new_context_tokens=key[1], backend="eager_instrumented",
                         **timer.resolve()))
             if self.profile_trace:
-                for mode in (m for m in self.modes if m in ("dual_stream", "serial_dual")):
+                for mode in (m for m in self.modes if self.stage_timings != "none"
+                             or m in ("dual_stream", "serial_dual")):
                     for backend in self.backends:
                         fn = (self.graphs[(loops, mode)] if backend == "cudagraph"
                               else lambda m=mode, n=loops: self.snapshot.forward(m, side_loops=n))
@@ -438,4 +594,12 @@ class DraftTimingObserver:
                 writer = csv.DictWriter(f, fieldnames=list(summaries[0]))
                 writer.writeheader()
                 writer.writerows(summaries)
+        stages = summarize_stages(self.stage_rows)
+        comparisons = compare_stages(stages)
+        for filename, rows in (("stage_summary.csv", stages), ("stage_comparison.csv", comparisons)):
+            if rows:
+                with (self.output / filename).open("w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
         return summaries

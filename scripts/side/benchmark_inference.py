@@ -34,6 +34,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--profile-trace", action="store_true")
     parser.add_argument("--no-component-timings", action="store_true")
+    parser.add_argument("--stage-timings", choices=("none", "branches", "layers", "modules"),
+        default="none", help="Separate instrumented replays on every call; graph events measure "
+        "branch spans/wait, optionally each layer and attention/MLP modules")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if min(args.max_samples, args.max_new_tokens, args.side_loops,
@@ -100,7 +103,8 @@ def run(args):
         warmup_calls=args.warmup_calls, measure_calls=args.measure_calls,
         buckets=args.buckets, modes=args.modes, backends=args.backends,
         seed=args.seed, profile_trace=args.profile_trace,
-        component_timings=not args.no_component_timings, loop_counts=args.loop_counts)
+        component_timings=not args.no_component_timings, loop_counts=args.loop_counts,
+        stage_timings=args.stage_timings)
     try:
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     except (OSError, subprocess.CalledProcessError):
@@ -161,6 +165,18 @@ def run(args):
               f"{row['wall_ms_mean']:14.4f} {row['gpu_ms_mean']:13.4f} "
               f"{row['overhead_wall_pct']:+9.2f}% {saved_text:>15s}")
     print(f"\nResults: {args.output / 'summary.csv'}", flush=True)
+    if args.stage_timings != "none":
+        from deepspec.eval.dspark.draft_timing import summarize_stages
+        print("\nSeparate instrumented stage means (ms; nested/overlapping stages are not additive):")
+        displayed = {"prepare", "shared_layer1", "main_tail", "side_after_fork", "join_wait",
+                     "fusion", "final_norm", "output_head", "proposal_heads",
+                     "side_late_ms", "instrumentation_extra_gpu"}
+        for row in summarize_stages(observer.stage_rows):
+            if row["stage"] in displayed:
+                print(f"loops={row['loops']} {row['mode']:13s} {row['backend']:10s} "
+                      f"{row['stage']:27s} {row['ms_mean']:.6f}")
+        print(f"\nStages: {args.output / 'stage_summary.csv'}")
+        print(f"Comparison: {args.output / 'stage_comparison.csv'}", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Verify matched snapshots, cache isolation and the loop-sweep timing protocol."""
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -7,10 +8,11 @@ import torch
 
 from deepspec.eval.dspark.draft_ops import forward_dspark_draft_block
 from deepspec.eval.dspark.draft_timing import (MODES, DraftTimingObserver, GraphForward,
-    StaticDraftInput, TimingComplete, bucket_size, summarize_calls)
+    ReplayPathTimer, StaticDraftInput, TimingComplete, branch_metrics, bucket_size,
+    compare_stages, summarize_calls, summarize_stages)
 from deepspec.modeling.dspark.context_cache import ContextKVCache
 from deepspec.modeling.dspark.qwen3 import Qwen3DSparkModel
-from deepspec.modeling.dspark.side_loop import prepare_paths, run_paths
+from deepspec.modeling.dspark.side_loop import PathTimer, prepare_paths, run_paths
 from scripts.side.benchmark_inference import parse_args
 from test_side_loop import side_config
 
@@ -210,6 +212,112 @@ def test_cli_loop_sweep_overrides_single_count_and_accepts_serial():
             parse_args(base + ["--loop-sweep", invalid])
 
 
+@pytest.mark.parametrize("mode", ["main_only", "side_only", "serial_dual"])
+@pytest.mark.parametrize("level", ["branches", "layers", "modules"])
+def test_stage_scopes_preserve_math_and_cover_expected_modules(mode, level):
+    class RecordingTimer(PathTimer):
+        def __init__(self):
+            super().__init__(True, torch.device("cpu"))
+            self.detail_level = level
+            self.names = []
+
+        @contextmanager
+        def stage(self, name):
+            self.names.append(name)
+            yield
+
+    model, ids = model_and_ids()
+    timer = RecordingTimer()
+    with torch.inference_mode():
+        snapshot = StaticDraftInput(model, 0, 6)
+        snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(1, 6, 64),
+            past_key_values=ContextKVCache(), position_ids=torch.arange(22).unsqueeze(0), start=6)
+        expected, expected_ids = snapshot.forward(mode, side_loops=2)
+        actual, actual_ids = snapshot.forward(mode, timer, side_loops=2)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert torch.equal(actual_ids, expected_ids)
+    assert {"total", "prepare", "shared_layer1", "final_norm", "output_head", "proposal_heads"} <= set(timer.names)
+    assert ("main_tail" in timer.names) == (mode != "side_only")
+    assert ("side_after_fork" in timer.names) == (mode != "main_only")
+    assert ("shared_l1" in timer.names) == (level != "branches")
+    assert ("shared_l1.mlp" in timer.names) == (level == "modules")
+    if level == "modules":
+        assert {"shared_l1.q_projection", "shared_l1.block_kv_rope", "shared_l1.kv_concat",
+                "shared_l1.attention_kernel", "shared_l1.o_projection"} <= set(timer.names)
+    if level != "branches":
+        assert ("side_repeat1_l1" in timer.names) == (mode != "main_only")
+        assert "side_repeat2_l1" not in timer.names
+
+
+def test_replay_timer_reuses_external_events_and_resolves_latest_timestamps(monkeypatch):
+    created, clock = [], [0.0]
+    class FakeEvent:
+        def __init__(self, **kwargs):
+            assert kwargs == dict(enable_timing=True, external=True)
+            created.append(self)
+
+        def record(self):
+            clock[0] += 1.0
+            self.timestamp = clock[0]
+
+        def elapsed_time(self, other):
+            return other.timestamp - self.timestamp
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    timer = ReplayPathTimer(torch.device("cuda"))
+    for repeat in range(3):
+        timer.begin_forward()
+        with timer.stage("total"):
+            with timer.stage("work"):
+                pass
+            with timer.stage("work"):
+                pass
+        timeline = timer.timeline()
+        assert timeline["total"] == dict(ms=5.0, start_ms=0.0, end_ms=5.0)
+        assert timeline["work"] == dict(ms=2.0, start_ms=1.0, end_ms=4.0)
+        assert len(created) == 6
+    assert created[0].timestamp == 13.0
+
+
+def test_branch_timeline_distinguishes_late_side_from_main_slowdown():
+    timeline = dict(fork_join=dict(start_ms=1.0, end_ms=3.0),
+        main_tail=dict(start_ms=1.1, end_ms=2.0),
+        side_after_fork=dict(start_ms=1.2, end_ms=1.6))
+    result = branch_metrics(timeline)
+    assert result["side_late_ms"] == 0.0
+    assert result["main_late_ms"] == pytest.approx(0.4)
+    assert result["branch_span_overlap_ms"] == pytest.approx(0.4)
+    timeline["side_after_fork"]["end_ms"] = 2.5
+    assert branch_metrics(timeline)["side_late_ms"] == pytest.approx(0.5)
+    assert branch_metrics({}) == {}
+
+
+def test_stage_summary_uses_all_calls_and_compares_corresponding_branch():
+    rows = []
+    for call in (1, 2):
+        for mode, values in (("main_only", {"main_tail": 1.0, "shared_layer1": 0.2}),
+                             ("side_only", {"side_repeat1_l1": 0.2}),
+                             ("dual_stream", {"main_tail": 1.1, "shared_layer1": 0.2,
+                                              "side_repeat1_l1": 0.3, "join_wait": 0.01})):
+            rows.append(dict(loops=2, mode=mode, backend="cudagraph", call=call, stage_ms=values))
+    summaries = summarize_stages(rows)
+    assert all(r["calls"] == 2 for r in summaries)
+    comparison = {r["stage"]: r for r in compare_stages(summaries)}
+    assert comparison["main_tail"]["control"] == "main_only"
+    assert comparison["main_tail"]["delta_pct"] == pytest.approx(10)
+    assert comparison["side_repeat1_l1"]["control"] == "side_only"
+    assert comparison["side_repeat1_l1"]["delta_ms"] == pytest.approx(0.1)
+    assert "join_wait" not in comparison
+
+
+def test_cli_accepts_three_path_loop2_module_diagnostics():
+    args = parse_args(["--target", "t", "--draft", "d", "--output", "o",
+        "--side-loops", "2", "--modes", "main_only,dual_stream,side_only",
+        "--backends", "cudagraph", "--stage-timings", "modules"])
+    assert args.loop_counts == (2,)
+    assert args.stage_timings == "modules"
+    assert len(args.modes) == 3
+
+
 @pytest.mark.parametrize("new", [1, 2, 5, 6])
 def test_bf16_exact_snapshot_keeps_original_projection_shapes(new):
     model, ids = model_and_ids()
@@ -307,3 +415,67 @@ def test_cuda_observer_excludes_warmup_stops_at_budget_and_keeps_reference_cache
     for setup in observer.setup_rows:
         assert setup["serial_dual_validated_loops"] == [1, 3, 5]
     assert json.loads((tmp_path / "metadata.json").read_text())["status"] == "complete"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Graph event timestamps require GPU")
+@pytest.mark.parametrize("mode", ["main_only", "side_only", "dual_stream"])
+def test_cuda_loop2_instrumented_graph_updates_events_and_preserves_outputs(mode):
+    model, ids = model_and_ids("cuda")
+    model = model.to(dtype=torch.bfloat16)
+    model._side_stream = torch.cuda.Stream()
+    timer = ReplayPathTimer(torch.device("cuda"), "modules")
+    with torch.inference_mode():
+        snapshot = StaticDraftInput(model, 0, 6)
+        cache = ContextKVCache()
+        def update():
+            snapshot.update(draft_input_ids=ids, target_hidden_states=torch.randn(
+                1, 6, 64, device="cuda", dtype=torch.bfloat16), past_key_values=cache,
+                position_ids=torch.arange(22, device="cuda").unsqueeze(0), start=6)
+        update()
+        plain = GraphForward(snapshot, mode, side_loops=2)
+        diagnostic = GraphForward(snapshot, mode, side_loops=2, timer=timer)
+        event_count = sum(len(pairs) for pairs in timer.events.values())
+        for repeat in range(2):
+            ids[:, 0] = repeat + 3
+            update()
+            expected, expected_ids = plain()
+            actual, actual_ids = diagnostic()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+            assert torch.equal(actual_ids, expected_ids)
+            timeline = timer.timeline()
+            assert timeline["total"]["ms"] > 0
+            assert timeline["shared_l1.mlp"]["ms"] > 0
+            assert all(r["ms"] >= 0 and r["end_ms"] >= r["start_ms"] for r in timeline.values())
+            assert sum(len(pairs) for pairs in timer.events.values()) == event_count
+            if mode == "dual_stream":
+                assert timeline["join_wait"]["ms"] >= 0
+                assert timeline["main_tail"]["end_ms"] <= timeline["fork_join"]["end_ms"]
+                assert timeline["side_after_fork"]["end_ms"] <= timeline["fork_join"]["end_ms"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Stage observer requires GPU")
+def test_cuda_loop2_observer_writes_matched_stage_reports_without_warmups(tmp_path):
+    model, ids = model_and_ids("cuda")
+    model = model.to(dtype=torch.bfloat16)
+    observer = DraftTimingObserver(model, tmp_path, warmup_calls=1, measure_calls=2,
+        modes=("main_only", "dual_stream", "side_only"), backends=("cudagraph",),
+        component_timings=False, loop_counts=(2,), stage_timings="modules")
+    cache = ContextKVCache()
+    with torch.inference_mode():
+        for call in range(3):
+            kwargs = dict(model=model, draft_input_ids=ids, target_hidden_states=torch.randn(
+                1, 6, 64, device="cuda", dtype=torch.bfloat16), past_key_values=cache,
+                position_ids=torch.arange(22, device="cuda").unsqueeze(0), start=6)
+            if call == 2:
+                with pytest.raises(TimingComplete):
+                    observer.observe(**kwargs)
+            else:
+                observer.observe(**kwargs)
+    assert cache.layers == {}
+    assert len(observer.rows) == len(observer.stage_rows) == 6
+    assert {r["reference_call"] for r in observer.stage_rows} == {2, 3}
+    assert all(r["calls"] == 2 for r in summarize_stages(observer.stage_rows))
+    observer.flush(status="complete")
+    for name in ("stage_summary.csv", "stage_comparison.csv", "stage_calls.jsonl"):
+        assert (tmp_path / name).stat().st_size > 0

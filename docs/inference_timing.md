@@ -44,6 +44,101 @@ python scripts/side/benchmark_inference.py \
   --output runs/inference_timing_10groups
 ```
 
+## Focused loops=2 stage diagnosis
+
+This test selects only `main_only`, `dual_stream`, and `side_only`, with total
+Layer1 count fixed at two. The dual path is one shared L1, followed by main
+L2–5 versus **one extra L1**, then fusion and output. Side-only performs L1 twice.
+It retains the existing schedule so instrumentation diagnoses the current code.
+
+```bash
+export CUDA_VISIBLE_DEVICES=7
+export DRAFT="$PWD/runs/dflash_side_p3_e3si/deepspec/dflash_side_A_maskonly_b16_r5_g3_k128_p3_e2_seed42/step_latest"
+export TIMING_OUT="$PWD/runs/timing_loop2_stages_$(date +%Y%m%d_%H%M%S)"
+
+python scripts/side/benchmark_inference.py \
+  --target /home/jovyan/LMM/lmm_model/Qwen3-4B \
+  --draft "$DRAFT" --task gsm8k \
+  --block-size 16 --side-loops 2 \
+  --modes main_only,dual_stream,side_only \
+  --backends cudagraph --stage-timings modules \
+  --warmup-calls 5 --measure-calls 50 \
+  --context-buckets 1024,4096 \
+  --no-component-timings --profile-trace \
+  --output "$TIMING_OUT"
+```
+
+For a smoke run change the warmup/measurement budgets to 1/2, using a fresh
+output directory. The formal run uses the same 50 measured reference states
+for all three paths. Each state has one uninstrumented forward and one separate
+instrumented forward per path; capture warmups/setup remain outside both budgets.
+
+`--stage-timings` accepts `branches`, `layers`, and `modules` (default `none`).
+Each level includes the preceding level. Branches measures prepare, shared L1,
+main tail, side tail, fork/join, final norm, fusion, head and sampling. Layers
+adds embedding, feature projection, RoPE, each context KV preparation and each
+decoder-layer call. Modules adds context project/append, Q projection/normalization,
+block KV projection/RoPE, KV concatenation, attention adapter/kernel, output
+projection, input/post-attention norm and MLP. It does not split MLP's internal
+linear operations. Module prefixes identify `shared_l1`, `main_l2` through
+`main_l5`, and `side_repeat1_l1`.
+
+Timing uses reusable `torch.cuda.Event(enable_timing=True, external=True)`
+event nodes inside **a separate CUDA Graph**. Events are initialized during
+warmup; timestamps are read only after replay completes. No stage synchronizes
+the CPU or waits for the other branch. The existing fork/join dependencies are
+preserved. External events are required to retain record nodes during graph
+capture; see [PyTorch Event documentation](https://docs.pytorch.org/docs/stable/generated/torch.cuda.Event.html).
+
+Results added by this option:
+
+| File | Content |
+| --- | --- |
+| `summary.csv` | Original uninstrumented total latency, three rows in this test |
+| `stage_summary.csv` | Mean/median/P90 for every stage across the 50 diagnostic calls |
+| `stage_comparison.csv` | Dual minus corresponding single-path stage; main stages compare with main-only, side-repeat stages compare with side-only |
+| `stage_calls.jsonl` | Per-call durations and begin/end offsets from that forward's total start; matched reference-call ID |
+
+Important rows to inspect:
+
+- `main_tail` and `main_l2`–`main_l5`: do the same four layers slow down when
+  the side branch is present? Inspect `.mlp`, `.attention_kernel`, etc. beneath
+  the layers to locate the increase.
+- `side_repeat1_l1`: compare the extra L1 in dual-stream with the second L1
+  in side-only. This isolates the recurrence instead of comparing full forwards.
+- `side_late_ms`: positive difference between side-end and main-end timestamps.
+  Zero means the side ends before the main tail in the instrumented schedule.
+- `join_wait`: main-stream elapsed time around the existing side-stream wait,
+  after the main tail. Includes event/synchronization scheduling overhead and
+  need not be exactly zero even if side-late is zero.
+- `main_start_after_fork_ms`, `side_start_after_fork_ms`: delayed branch starts.
+- `instrumentation_extra_gpu`: instrumented GPU span minus the matched
+  uninstrumented GPU span. This is the perturbation check, not branch work.
+
+Event nodes can change kernel scheduling. Judge original overhead using
+`summary.csv`; stage results explain the instrumented replay. If instrumentation
+inflation is material compared with the overhead under investigation, repeat
+with `--stage-timings branches` in a new directory before attributing a cause.
+Nested parent/child stages and overlapping branches **must not be summed**.
+`branch_span_overlap_ms` is overlap of elapsed branch spans, including any idle
+intervals; it is not simultaneous kernel-active time.
+
+With stage timing enabled, `--profile-trace` saves **uninstrumented** traces for
+all selected modes, enabling the three paths to be compared without event-node
+perturbation. The older `components.json` remains a separate, one-state eager
+diagnostic and can be disabled as in this command. It is not the source of the
+new 50-call graph stage averages. Fusion timing now excludes the separately
+reported `final_norm` stage.
+
+Code locations:
+
+- `scripts/side/benchmark_inference.py`: CLI and real-reference decoding.
+- `deepspec/eval/dspark/draft_timing.py`: snapshots, graph capture, replay event
+  timer, stage statistics and paired-path comparisons.
+- `deepspec/modeling/dspark/side_loop.py`: shared L1, branch scheduling, join wait,
+  individual layer scopes, fusion and final norm.
+- `deepspec/modeling/dspark/qwen3/modeling.py`: attention/MLP module scopes.
+
 ## CUDA Graph loop sweep and serial control
 
 Run both new tests together on one matched set of reference inputs:
